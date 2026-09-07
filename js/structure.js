@@ -151,6 +151,10 @@ const CLASS_PLANET = 'planet'
 const CLASS_GAS_GIANT = 'gasGiant'
 const CLASS_BROWN_DWARF = 'brownDwarf'
 const CLASS_STAR = 'star'
+// Not reachable from mass alone: a 10 Msun black hole and a 10 Msun star weigh
+// the same. It is reached only when the composition carries the black hole
+// marker - see markBlackHole() below.
+const CLASS_BLACK_HOLE = 'blackHole'
 
 // A gas giant is a planet-mass body whose mass is mostly envelope. The mass
 // floor is the runaway gas accretion threshold: below ~10 Earth masses a core
@@ -164,7 +168,194 @@ const CLASS_LABELS_PT_BR = {
     planet: 'Planeta',
     gasGiant: 'Gigante gasoso',
     brownDwarf: 'Anã marrom',
-    star: 'Estrela'
+    star: 'Estrela',
+    blackHole: 'Buraco negro'
+}
+
+// ============================================================================
+// Black holes
+// ============================================================================
+
+/**
+ * A BLACK HOLE IS DYNAMICALLY JUST A POINT MASS.
+ *
+ * Nothing in this file, and nothing in the integrator, gives one a special
+ * gravity. Newtonian gravity has no way to tell a 10 Msun black hole from a
+ * 10 Msun star: same force, same orbits, same conserved quantities, bit for
+ * bit. What changes is everything that is NOT dynamics - how big it is, what it
+ * is called, whether it burns, what colour it is, and what happens to whatever
+ * gets too close.
+ *
+ * WHY THERE IS NO PACZYNSKI-WIITA POTENTIAL HERE, and why nobody should add one:
+ * the pseudo-Newtonian potential -GM/(r - r_s) reproduces the innermost stable
+ * circular orbit at 3*r_s and the plunge inside it. For a 10 Msun hole that is
+ * 6e-7 AU. The simulation's Plummer softening is 1e-3 AU, so every one of those
+ * effects lives four to five orders of magnitude BELOW the length at which the
+ * force law is already deliberately wrong. It would be decoration painted over
+ * a scale we cannot resolve, at the cost of a special case in the hottest loop
+ * in the program and of exact momentum conservation. For a supermassive hole
+ * (r_s ~ 0.02-0.08 AU) the ISCO is marginally resolvable, but the stars around
+ * it orbit at 1e3-1e5 r_s where the correction is one part in 1e3 to 1e5.
+ *
+ * A black hole IS marked as a star (`isStar`) for the force solver. That is not
+ * a claim that it shines - it does not - it is the direct-summation flag: bodies
+ * on that list are summed exactly, one by one, outside the Barnes-Hut tree. A
+ * black hole is by construction one of the heaviest things in any system that
+ * contains it, and approximating it through the tree would corrupt every orbit
+ * around it. Same reason the stars are on that list, same treatment.
+ */
+
+// The marker. It lives on the COMPOSITION rather than on the Planet because
+// classify(), radiusFor() and describe() are pure functions of (mass,
+// composition) and must be able to answer for a black hole with nothing else in
+// hand - the UI's body-creation preview calls describe() before any Planet
+// exists. It survives accretion for free: blend() averages the fraction arrays
+// and never touches this flag, so a hole that eats a star keeps its own
+// composition object, keeps the marker, and gains the mass. See planet.js.
+const STRUCTURE_BLACK_HOLE_FLAG = 'isBlackHole'
+
+// The horizon is black. This is the colour of the hole itself; light from an
+// accretion disk is reported through the luminosity field instead, because the
+// disk is not the hole and does not share its (nonexistent) surface.
+const BLACK_HOLE_COLOR = { r: 6 / 255, g: 6 / 255, b: 10 / 255 }
+
+/** Mark a composition as belonging to a black hole. Returns it, for chaining. */
+function markBlackHole(composition) {
+    if (composition) {
+        composition[STRUCTURE_BLACK_HOLE_FLAG] = true
+    }
+    return composition
+}
+
+/** Is this composition a black hole's? Cheap enough for the hot path. */
+function isBlackHoleComposition(composition) {
+    return !!(composition && composition[STRUCTURE_BLACK_HOLE_FLAG] === true)
+}
+
+/**
+ * Schwarzschild radius, in AU:
+ *
+ *     r_s = 2GM/c^2
+ *
+ * With G = 4*PI^2 and c = 63241 AU/yr this is 1.974e-8 AU per solar mass -
+ * 235524 times smaller than the Sun itself. Reference points:
+ *
+ *     1 Msun      1.974e-8 AU
+ *     10 Msun     1.974e-7 AU
+ *     1e6 Msun    1.974e-2 AU
+ *     4.3e6 Msun  8.489e-2 AU   (Sagittarius A*)
+ *
+ * BE HONEST ABOUT WHAT THIS MEANS HERE. A stellar-mass horizon is five orders
+ * of magnitude below SOFTENING, so at this resolution such a hole is not
+ * distinguishable from any other compact point mass, and the code does not
+ * pretend otherwise: capture is done on the tidal radius, which is macroscopic.
+ * A supermassive horizon at 20-85x the softening length genuinely is resolved.
+ *
+ * Also note the identity that falls out of it: the Newtonian escape speed from
+ * r_s is exactly c. That is not a coincidence, it is how the radius is defined,
+ * and it has a useful side effect in simulation.js - the impact-speed test that
+ * decides whether a collision is erosive can never fire on a black hole,
+ * because nothing hits it faster than 2.5c. Nothing bounces off a black hole.
+ */
+function schwarzschildRadius(mass) {
+    if (!(mass > 0) || !isFinite(mass)) {
+        return 0
+    }
+    return 2 * GRAVITATION_CONSTANT * mass / SPEED_OF_LIGHT_SQUARED
+}
+
+/**
+ * Tidal disruption radius, in AU: the separation at which the hole's tide across
+ * the victim exceeds the victim's own self-gravity and pulls it apart.
+ *
+ *     R_t ~ R_victim * (M_hole / M_victim)^(1/3)
+ *
+ * This is the radius that matters. It is macroscopic where the horizon is not:
+ *
+ *     10 Msun   vs a Sun-like star   0.0100 AU
+ *     1e6 Msun  vs a Sun-like star   0.465 AU
+ *     4.3e6 Msun vs a Sun-like star  0.756 AU
+ *
+ * Rewriting it as R_t = (3*M_hole / (4*PI*rho_victim))^(1/3) shows what it
+ * really depends on: only the hole's mass and the victim's MEAN DENSITY. A dense
+ * rocky body survives closer in; a puffy massive star is shredded further out.
+ *
+ * Note the ordering against the horizon: R_t grows as M^(1/3) and r_s as M, so
+ * they cross at 1.14e8 Msun for a Sun-like victim. Above that a solar-type star
+ * is swallowed whole, inside the horizon, with no disruption and no flare -
+ * which is exactly what real supermassive holes do, and it falls out of the two
+ * formulas rather than being coded in.
+ */
+function tidalDisruptionRadius(holeMass, victimMass, victimRadius) {
+    if (!(holeMass > 0) || !(victimMass > 0) || !(victimRadius > 0)) {
+        return 0
+    }
+    return victimRadius * Math.cbrt(holeMass / victimMass)
+}
+
+/**
+ * The radius at which a black hole actually captures a given body, in AU.
+ *
+ * The largest of three lengths, because any one of them is sufficient:
+ *
+ *  1. the tidal radius - the star is destroyed here, and the debris is bound;
+ *  2. the horizon - relevant only above ~1e8 Msun, where it overtakes the tide;
+ *  3. BLACK_HOLE_MIN_CAPTURE_RADIUS (= SOFTENING) - below the softening length
+ *     the force law has been deliberately flattened and the two-body problem is
+ *     no longer being integrated correctly, so continuing to track the pair as
+ *     two bodies would be a fiction. This floor is also the only reason two
+ *     stellar-mass holes can ever merge: their horizons are 2e-7 AU across and
+ *     no timestep this side of absurdity would resolve that contact.
+ *
+ * Deliberately NOT the ACCRETION_RADIUS_FACTOR * radius rule used by everything
+ * else: 800 times a 2e-8 AU horizon is 1.6e-5 AU, which would never capture
+ * anything, ever.
+ */
+function blackHoleCaptureRadius(holeMass, victimMass, victimRadius) {
+    let radius = tidalDisruptionRadius(holeMass, victimMass, victimRadius)
+    const horizon = schwarzschildRadius(holeMass)
+    if (horizon > radius) {
+        radius = horizon
+    }
+    if (BLACK_HOLE_MIN_CAPTURE_RADIUS > radius) {
+        radius = BLACK_HOLE_MIN_CAPTURE_RADIUS
+    }
+    return radius
+}
+
+/**
+ * Luminosity of the accretion disk, in solar luminosities, from the rate at
+ * which the hole is being fed (Msun/yr):
+ *
+ *     L = eta * dM/dt * c^2
+ *
+ * with eta = BLACK_HOLE_ACCRETION_EFFICIENCY (0.1). Accretion is the most
+ * efficient engine in the universe: 10% of rest mass against 0.7% for hydrogen
+ * fusion, which is why a quasar outshines its entire host galaxy.
+ *
+ * THE HOLE IS STILL BLACK. Nothing escapes the horizon and this function says
+ * nothing about the horizon. The light comes from the disk outside it - matter
+ * shredded, circularised, and heated by viscous friction as it spirals in - so
+ * the emission is reported as luminosity while the body's own colour and
+ * effective temperature stay black and zero.
+ *
+ * Capped at the Eddington limit: past it, radiation pressure on the infalling
+ * gas exceeds the hole's pull and blows the fuel supply away.
+ */
+function accretionDiskLuminosity(holeMass, accretionRate) {
+    if (!(accretionRate > 0) || !isFinite(accretionRate)) {
+        return 0
+    }
+    // eta * mdot * c^2 lands in Msun*AU^2/yr^3; convert to Lsun.
+    const luminous = BLACK_HOLE_ACCRETION_EFFICIENCY * accretionRate *
+        SPEED_OF_LIGHT_SQUARED / SOLAR_LUMINOSITY_IN_SIMULATION_UNITS
+    if (BLACK_HOLE_EDDINGTON_LIMITED) {
+        const limit = eddingtonLuminosity(holeMass)
+        if (limit > 0 && luminous > limit) {
+            return limit
+        }
+    }
+    return luminous
 }
 
 // ============================================================================
@@ -420,6 +611,12 @@ function radiusFor(mass, composition) {
     if (!(mass > 0) || !isFinite(mass)) {
         return 0
     }
+    // A black hole has no interior, no equation of state and no composition
+    // dependence at all: its size is fixed by its mass and by c alone. Checked
+    // first so none of the fitted branches below can ever see one.
+    if (isBlackHoleComposition(composition)) {
+        return schwarzschildRadius(mass)
+    }
 
     let gas = 0
     let ice = 0
@@ -525,6 +722,12 @@ function centralTemperature(mass, radius, composition) {
     if (!(radius > 0) || !(mass > 0)) {
         return 0
     }
+    // There is no centre to take the temperature of. The hydrostatic estimate
+    // would happily return 1e12 K from a Schwarzschild radius; zero is the
+    // honest answer, and it is also what keeps fusion away from black holes.
+    if (isBlackHoleComposition(composition)) {
+        return 0
+    }
     const mu = Math.max(0.01, structureNumber(
         composition && composition.meanMolecularWeight, SOLAR_MEAN_MOLECULAR_WEIGHT))
 
@@ -552,8 +755,14 @@ function centralTemperature(mass, radius, composition) {
  * Earth, Jupiter and the Sun all within a factor of two of their measured
  * central pressures. Two significant figures it is not.
  */
-function centralPressure(mass, radius) {
+function centralPressure(mass, radius, composition) {
     if (!(radius > 0) || !(mass > 0)) {
+        return 0
+    }
+    // Same as centralTemperature: no interior, no pressure to report. The third
+    // argument is optional and was added for this test alone; every existing
+    // two-argument call still behaves exactly as before.
+    if (isBlackHoleComposition(composition)) {
         return 0
     }
     const solarRadii = radius / SOLAR_RADIUS
@@ -580,6 +789,13 @@ function centralPressure(mass, radius) {
  * Returns 'asteroid' | 'planet' | 'gasGiant' | 'brownDwarf' | 'star'.
  */
 function classify(mass, composition) {
+    // FIRST, and by an explicit marker rather than by mass: a black hole and a
+    // star of the same mass are indistinguishable by mass, which is the whole
+    // problem. Checked before the finite-mass guard as well, so a marked body
+    // is never quietly demoted to an asteroid at any mass, however silly.
+    if (isBlackHoleComposition(composition)) {
+        return CLASS_BLACK_HOLE
+    }
     if (!(mass > 0) || !isFinite(mass)) {
         return CLASS_ASTEROID
     }
@@ -630,6 +846,14 @@ function luminosity(mass, classification) {
         return 0
     }
     const cls = classification || classify(mass, null)
+
+    // No fusion, no contraction, no surface: the hole radiates nothing. Light
+    // from an accretion disk is not a property of the mass and cannot be
+    // computed here - it needs a feeding rate. See accretionDiskLuminosity(),
+    // which planet.js/simulation.js drive from the mass actually captured.
+    if (cls === CLASS_BLACK_HOLE) {
+        return 0
+    }
 
     if (cls === CLASS_STAR) {
         if (mass < 0.43) {
@@ -780,6 +1004,38 @@ function blackbodyColorHex(temperature) {
 function describe(mass, composition) {
     const radius = radiusFor(mass, composition)
     const classification = classify(mass, composition)
+
+    // A black hole answers every one of these, and none of the answers comes
+    // from a fitted stellar relation. Radius is the horizon, the two interior
+    // conditions are zero because there is no interior, luminosity and effective
+    // temperature are zero because the horizon emits nothing, and the colour is
+    // the horizon's own - not a blackbody colour derived from a zero
+    // temperature, which would be clamped to a meaningless deep red.
+    //
+    // An accreting hole is bright, but its brightness depends on how fast it is
+    // being fed, which is not knowable from (mass, composition); the live
+    // Planet carries it in the same `luminosity` field. See planet.js.
+    if (classification === CLASS_BLACK_HOLE) {
+        return {
+            radius: radius,
+            density: meanDensity(mass, radius),
+            centralTemperature: 0,
+            centralPressure: 0,
+            classification: classification,
+            classLabel: classLabel(classification),
+            luminosity: 0,
+            effectiveTemperature: 0,
+            luminous: false,
+            color: BLACK_HOLE_COLOR,
+            colorHex: BLACK_HOLE_COLOR_HEX,
+            schwarzschildRadius: radius,
+            // What it would tear a Sun-like star apart at, and therefore roughly
+            // what it eats at. Macroscopic where the horizon is not.
+            tidalRadius: tidalDisruptionRadius(mass, 1, SOLAR_RADIUS),
+            eddingtonLuminosity: eddingtonLuminosity(mass)
+        }
+    }
+
     const bodyLuminosity = luminosity(mass, classification)
     const surfaceTemperature = effectiveTemperature(bodyLuminosity, radius)
 
@@ -787,12 +1043,13 @@ function describe(mass, composition) {
         radius: radius,
         density: meanDensity(mass, radius),
         centralTemperature: centralTemperature(mass, radius, composition),
-        centralPressure: centralPressure(mass, radius),
+        centralPressure: centralPressure(mass, radius, composition),
         classification: classification,
         classLabel: classLabel(classification),
         luminosity: bodyLuminosity,
         effectiveTemperature: surfaceTemperature,
         luminous: bodyLuminosity > 0,
-        color: blackbodyColor(surfaceTemperature)
+        color: blackbodyColor(surfaceTemperature),
+        colorHex: blackbodyColorHex(surfaceTemperature)
     }
 }

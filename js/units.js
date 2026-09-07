@@ -33,12 +33,60 @@ const SOLAR_RADIUS = 6.957e8 / AU_METERS                    // 4.650e-3
 const EARTH_RADIUS = 6.371e6 / AU_METERS                    // 4.259e-5
 const JUPITER_RADIUS = 6.9911e7 / AU_METERS                 // 4.673e-4
 
+// --- Speed of light ------------------------------------------------------------
+/**
+ * c in simulation units, AU/yr. Derived, never guessed:
+ *
+ *     299792458 m/s * 3.15576e7 s/yr / 1.495978707e11 m/AU = 63241.08 AU/yr
+ *
+ * It appears in exactly two places: the Schwarzschild radius of a black hole
+ * (structure.js) and the rest-mass energy of accreted material. It is NOT used
+ * anywhere in the force law - gravity in this simulation is Newtonian and stays
+ * Newtonian; see the note on Paczynski-Wiita in structure.js.
+ */
+const SPEED_OF_LIGHT_METERS_PER_SECOND = 299792458
+const SPEED_OF_LIGHT = SPEED_OF_LIGHT_METERS_PER_SECOND * YEAR_SECONDS / AU_METERS
+const SPEED_OF_LIGHT_SQUARED = SPEED_OF_LIGHT * SPEED_OF_LIGHT
+
 // --- Temperatures and luminosity ----------------------------------------------
 // Luminosity is carried in solar luminosities, which lets us use
 // L/Lsun = (R/Rsun)^2 * (T/Tsun)^4 and never touch the Stefan-Boltzmann
 // constant in simulation units.
 const SOLAR_EFFECTIVE_TEMPERATURE = 5772           // K
 const SOLAR_LUMINOSITY = 1                         // by definition
+
+/**
+ * The one place a luminosity has to leave solar units: an accretion disk's
+ * output is set by a mass flow (Msun/yr) times c^2, which lands in
+ * Msun*AU^2/yr^3 and has to be converted back to Lsun for the rest of the code.
+ *
+ *     1 Msun*AU^2/yr^3 = 1.4166e30 W = 3700 Lsun
+ *     1 Lsun           = 2.703e-4 Msun*AU^2/yr^3
+ *
+ * Both are derived below rather than quoted, so a change to any SI reference
+ * above propagates.
+ */
+const SOLAR_LUMINOSITY_WATTS = 3.828e26
+const WATTS_PER_SIMULATION_LUMINOSITY =
+    SOLAR_MASS_KG * AU_METERS * AU_METERS /
+    (YEAR_SECONDS * YEAR_SECONDS * YEAR_SECONDS)
+const SOLAR_LUMINOSITY_IN_SIMULATION_UNITS =
+    SOLAR_LUMINOSITY_WATTS / WATTS_PER_SIMULATION_LUMINOSITY
+
+/**
+ * Eddington luminosity per solar mass, in Lsun/Msun: the luminosity at which
+ * radiation pressure on free electrons balances gravity, so an accreting body
+ * cannot shine much brighter for long without blowing its own fuel supply away.
+ *
+ *     L_Edd = 4*pi*G*M*m_p*c / sigma_T = 1.257e31 W * (M/Msun) = 32840 Lsun * (M/Msun)
+ *
+ * Evaluated once in SI (it needs the proton mass and the Thomson cross-section,
+ * neither of which belongs in simulation units) and kept as the single number.
+ * Note the pleasing coincidence that structure.luminosity() gives the most
+ * massive stars 32000*M Lsun - massive stars really do sit at their own
+ * Eddington limit.
+ */
+const EDDINGTON_LUMINOSITY_PER_SOLAR_MASS = 3.284e4          // Lsun / Msun
 
 /**
  * Mass thresholds that separate the physical classes of body. These are not
@@ -142,4 +190,14 @@ function escapeSpeed(mass, radius) {
  */
 function hillRadius(mass, centralMass, distance) {
     return distance * Math.pow(mass / (3 * centralMass), 1 / 3)
+}
+
+/** Rest-mass energy of a mass, in simulation units (Msun*AU^2/yr^2). */
+function restMassEnergy(mass) {
+    return mass * SPEED_OF_LIGHT_SQUARED
+}
+
+/** Eddington luminosity of a body, in solar luminosities. */
+function eddingtonLuminosity(mass) {
+    return mass > 0 ? EDDINGTON_LUMINOSITY_PER_SOLAR_MASS * mass : 0
 }

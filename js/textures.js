@@ -14,7 +14,8 @@
  *   repository gains no binary assets and the simulation still starts offline.
  *
  * WHAT DRIVES THE APPEARANCE
- *   classification  ('asteroid'|'planet'|'gasGiant'|'brownDwarf'|'star')
+ *   classification  ('asteroid'|'planet'|'gasGiant'|'brownDwarf'|'star'|
+ *                    'blackHole')
  *   composition     (.gasFraction .iceFraction .rockFraction .metalFraction)
  *   effectiveTemperature (only meaningful for bodies that emit their own light)
  *   mass, and a seed derived from planet.id
@@ -24,11 +25,23 @@
  *   comes out banded. That is the whole point: the picture is a readout of the
  *   physics, not decoration bolted on top of it.
  *
+ * BLACK HOLES
+ *   Every path above is wrong for one. A horizon has no surface, so no map is a
+ *   map OF anything; its temperature is zero, so its blackbody colour is a
+ *   clamped red rather than black; and it emits nothing, so the star treatment -
+ *   granulation, limb darkening, an additive halo - is exactly backwards. A
+ *   black hole therefore takes a separate route from textureClassOf() all the
+ *   way to the mesh: a genuinely black unlit sphere for the horizon, and the
+ *   accretion disk, photon ring and shadow around it carrying all the light.
+ *   See the "Black holes" tunables below and textureDrawAccretionDisk().
+ *
  * THREE.JS
  *   r147, UMD global. Every API used here was checked against js/libs/three.js:
  *   CanvasTexture, SphereGeometry, RingGeometry, Mesh, Group,
  *   MeshLambertMaterial (map / emissive / emissiveMap), MeshBasicMaterial,
  *   DoubleSide, RepeatWrapping, ClampToEdgeWrapping, sRGBEncoding,
+ *   AdditiveBlending, Color, Object3D.renderOrder, Material.transparent /
+ *   opacity / depthWrite / blending / toneMapped,
  *   Material.dispose, Texture.dispose, BufferGeometry.dispose, onBeforeCompile.
  *
  * SAFETY
@@ -86,6 +99,63 @@ const TEXTURE_TEMPERATURE_RATIO = 1.12
 // Limb darkening coefficient for stars, the usual linear law
 // I(mu)/I(1) = 1 - u*(1 - mu). u = 0.6 is the solar value in the visible.
 const TEXTURE_LIMB_DARKENING = 0.6
+
+// --- Black holes -----------------------------------------------------------
+//
+// Radii here are in Schwarzschild radii. That is exactly the radius the physics
+// hands the renderer for a black hole, and DetailBodyPool scales the whole
+// group by the drawn radius, so the horizon sphere is 1 unit and every number
+// below is a multiple of the horizon.
+
+// Innermost stable circular orbit of a non-rotating hole: 6 GM/c^2 = 3 R_s.
+// A thin disk cannot exist inside it, so this is where the disk starts.
+const TEXTURE_BH_ISCO = 3
+// The disk is drawn as two concentric annuli purely so they can be spun at
+// different rates - see the Keplerian shear note in DetailBodyPool.
+const TEXTURE_BH_DISK_SPLIT = 7
+const TEXTURE_BH_DISK_OUTER = 16
+// The apparent shadow of a Schwarzschild hole has radius sqrt(27)/2 = 2.598
+// R_s, larger than the horizon because light bends round it, and the photon
+// ring sits on its rim.
+const TEXTURE_BH_SHADOW_RADIUS = 2.598
+const TEXTURE_BH_PHOTON_INNER = 2.35
+const TEXTURE_BH_PHOTON_OUTER = 3
+// Width of the bright band, as a fraction of the photon ring's outer radius.
+const TEXTURE_BH_PHOTON_WIDTH = 0.035
+const TEXTURE_BH_PHOTON_BRIGHTNESS = 0.9
+const TEXTURE_BH_SHADOW_OPACITY = 0.55
+
+// Eddington luminosity: L_edd = 1.26e38 (M/Msun) erg/s and L_sun = 3.828e33
+// erg/s, so in solar luminosities L_edd ~ 3.29e4 (M/Msun).
+const TEXTURE_BH_EDDINGTON_PER_MASS = 3.29e4
+// Assumed when nobody hands us an accretion luminosity. A tenth of Eddington is
+// an ordinary Seyfert or a soft-state X-ray binary: visibly fed, not blazing.
+const TEXTURE_BH_DEFAULT_EDDINGTON = 0.1
+const TEXTURE_BH_MIN_EDDINGTON = 1e-4
+// Anchor of the disk temperature scale: a 10 Msun hole at a tenth of Eddington
+// gets a 30000 K inner disk. See textureDiskPeakTemperature for why this is an
+// anchor and not a prediction.
+const TEXTURE_BH_ANCHOR_MASS = 10
+const TEXTURE_BH_ANCHOR_TEMPERATURE = 30000
+const TEXTURE_BH_MIN_TEMPERATURE = 1200
+const TEXTURE_BH_MAX_TEMPERATURE = 34000
+// Peak of the thin-disk radial temperature shape, at x = 49/36. Computed rather
+// than written out so the shape and its normalisation cannot drift apart.
+const TEXTURE_BH_PROFILE_PEAK = Math.pow(49 / 36, -0.75) *
+    Math.pow(1 - Math.pow(49 / 36, -0.5), 0.25)
+// Peak brightness written into a disk texture, 0..255.
+const TEXTURE_BH_DISK_GAIN = 235
+// Keplerian rate at 1 R_s, radians per second of WALL CLOCK. Showmanship in
+// absolute terms - the real figure is ~1e4 rad/s for a stellar-mass hole - but
+// the ratio between the two annuli below is the true r^(-3/2) one.
+const TEXTURE_BH_SPIN_SCALE = 7.5
+const TEXTURE_BH_INNER_SPIN = TEXTURE_BH_SPIN_SCALE *
+    Math.pow((TEXTURE_BH_ISCO + TEXTURE_BH_DISK_SPLIT) / 2, -1.5)
+const TEXTURE_BH_OUTER_SPIN = TEXTURE_BH_SPIN_SCALE *
+    Math.pow((TEXTURE_BH_DISK_SPLIT + TEXTURE_BH_DISK_OUTER) / 2, -1.5)
+
+// Radial resolution of the shared annulus rasteriser's lookup tables.
+const TEXTURE_ANNULUS_SAMPLES = 1024
 
 // ============================================================================
 // Small pure helpers - no DOM, no THREE, testable in node
@@ -425,14 +495,113 @@ const TEXTURE_CLASS_PLANET = 'planet'
 const TEXTURE_CLASS_GAS_GIANT = 'gasGiant'
 const TEXTURE_CLASS_BROWN_DWARF = 'brownDwarf'
 const TEXTURE_CLASS_STAR = 'star'
+const TEXTURE_CLASS_BLACK_HOLE = 'blackHole'
 const TEXTURE_CLASSES = [TEXTURE_CLASS_ASTEROID, TEXTURE_CLASS_PLANET,
-    TEXTURE_CLASS_GAS_GIANT, TEXTURE_CLASS_BROWN_DWARF, TEXTURE_CLASS_STAR]
+    TEXTURE_CLASS_GAS_GIANT, TEXTURE_CLASS_BROWN_DWARF, TEXTURE_CLASS_STAR,
+    TEXTURE_CLASS_BLACK_HOLE]
+
+/**
+ * Is this body a black hole?
+ *
+ * Two independent signals, either of which is enough, because the flag and the
+ * classification are being added by other files and may arrive separately or
+ * not at all. When neither is present the body falls through to the ordinary
+ * mass-based guess and is drawn as whatever it looks like - which is the right
+ * degradation, not a bug.
+ */
+function textureIsBlackHole(planet) {
+    if (!planet) {
+        return false
+    }
+    if (planet.isBlackHole === true) {
+        return true
+    }
+    return planet.classification === TEXTURE_CLASS_BLACK_HOLE
+}
+
+// ---------------------------------------------------------------------------
+// Accretion physics, such as it is. Pure, no DOM, no THREE.
+// ---------------------------------------------------------------------------
+
+/**
+ * Accretion rate as a fraction of the Eddington rate, inferred from whatever
+ * luminosity the physics is willing to give us. Never throws, never returns
+ * anything but a finite number in (0, 1].
+ */
+function textureEddingtonRatio(mass, luminosity) {
+    const m = textureNumber(mass, 0)
+    const l = textureNumber(luminosity, 0)
+    if (!(m > 0) || !(l > 0)) {
+        return TEXTURE_BH_DEFAULT_EDDINGTON
+    }
+    const ratio = l / (TEXTURE_BH_EDDINGTON_PER_MASS * m)
+    if (!isFinite(ratio)) {
+        return TEXTURE_BH_DEFAULT_EDDINGTON
+    }
+    return textureClamp(ratio, TEXTURE_BH_MIN_EDDINGTON, 1)
+}
+
+/**
+ * Temperature at the hottest point of the accretion disk, in kelvin.
+ *
+ * A standard thin disk peaks at T ~ (Mdot / M^2)^(1/4), and at a fixed fraction
+ * of the Eddington rate Mdot ~ M, so T ~ M^(-1/4) * f_edd^(1/4). BOTH SCALINGS
+ * ARE REAL: a stellar-mass hole's disk peaks in the X-ray, a supermassive one's
+ * in the ultraviolet, and a hole fed harder runs hotter.
+ *
+ * The ABSOLUTE numbers are not. A real disk peaks near 1e7 K around a stellar
+ * hole and 1e5 K around a supermassive one, and every blackbody above ~30000 K
+ * is the same blue-white to the eye, so drawing the true values would make
+ * every black hole in the simulation identical and identically blue. The anchor
+ * slides the whole scale down into the range the eye can read while keeping the
+ * two exponents intact: a stellar-mass hole comes out blue-white, a
+ * supermassive one comes out the deep orange-red the Event Horizon Telescope
+ * images are drawn in, and feeding either one harder moves it toward blue.
+ */
+function textureDiskPeakTemperature(mass, luminosity) {
+    const m = textureNumber(mass, 0)
+    const scale = (m > 0) ? m : TEXTURE_BH_ANCHOR_MASS
+    const ratio = textureEddingtonRatio(m, luminosity)
+    const temperature = TEXTURE_BH_ANCHOR_TEMPERATURE *
+        Math.pow(scale / TEXTURE_BH_ANCHOR_MASS, -0.25) *
+        Math.pow(ratio / TEXTURE_BH_DEFAULT_EDDINGTON, 0.25)
+    if (!isFinite(temperature)) {
+        return TEXTURE_BH_ANCHOR_TEMPERATURE
+    }
+    return textureClamp(temperature, TEXTURE_BH_MIN_TEMPERATURE,
+        TEXTURE_BH_MAX_TEMPERATURE)
+}
+
+/**
+ * Radial temperature shape of a thin disk, normalised so its peak is 1.
+ *
+ *     T(r) ~ r^(-3/4) * (1 - sqrt(r_isco / r))^(1/4),   x = r / r_isco
+ *
+ * The r^(-3/4) is the familiar Shakura-Sunyaev result. The second factor is the
+ * zero-torque inner boundary condition, and it is what makes the disk fade to
+ * nothing AT the ISCO and peak just outside it at x = 49/36 instead of being
+ * hottest at its own inner edge. It costs one more pow and it is the difference
+ * between a disk and a bright washer.
+ */
+function textureDiskTemperatureShape(x) {
+    if (!(x > 1) || !isFinite(x)) {
+        return 0
+    }
+    const shape = Math.pow(x, -0.75) * Math.pow(1 - Math.pow(x, -0.5), 0.25)
+    return isFinite(shape) ? shape / TEXTURE_BH_PROFILE_PEAK : 0
+}
 
 /**
  * Classification of a body, tolerating every way it can be missing.
  * Prefers the body's own field, then structure.js, then a mass-only guess.
  */
 function textureClassOf(planet) {
+    // The flag wins over everything: a body may be flagged before structure.js
+    // has had a chance to relabel it, and a black hole drawn as a star for one
+    // frame is a bright white ball where a hole should be.
+    if (planet && planet.isBlackHole === true) {
+        return TEXTURE_CLASS_BLACK_HOLE
+    }
     if (planet && typeof planet.classification === 'string' &&
         TEXTURE_CLASSES.indexOf(planet.classification) !== -1) {
         return planet.classification
@@ -497,6 +666,10 @@ function textureRawOf(planet) {
         // Only a self-luminous body has a meaningful surface temperature here:
         // structure.js derives it from luminosity, which is 0 for a rock.
         temperature: Math.max(0, textureNumber(planet && planet.effectiveTemperature, 0)),
+        // Only black holes read this, and only to decide how hard the disk is
+        // being fed. It is 0 for a body that has no luminosity and for a body
+        // whose physics never supplies one, and both are handled.
+        luminosity: Math.max(0, textureNumber(planet && planet.luminosity, 0)),
         seed: textureSeedFromId(planet ? planet.id : 0)
     }
 }
@@ -519,6 +692,19 @@ function textureRawStable(previous, current) {
     }
     if (previous.classification !== current.classification) {
         return false
+    }
+    if (previous.classification === TEXTURE_CLASS_BLACK_HOLE) {
+        // A horizon has no composition and no photosphere, so the comparisons
+        // below would be measuring noise. The only two numbers that change how
+        // a black hole is drawn are its mass and how hard it is being fed, and
+        // both enter the key logarithmically.
+        if (current.mass > 0 && previous.mass > 0 &&
+            Math.abs(Math.log10(current.mass / previous.mass)) >= 0.5) {
+            return false
+        }
+        const before = textureEddingtonRatio(previous.mass, previous.luminosity)
+        const after = textureEddingtonRatio(current.mass, current.luminosity)
+        return Math.abs(Math.log10(after / before)) < 0.25
     }
     const tolerance = 0.5 / TEXTURE_FRACTION_BUCKETS
     if (Math.abs(previous.gas - current.gas) >= tolerance ||
@@ -549,6 +735,9 @@ function textureRawStable(previous, current) {
 
 /** Quantise raw physics into the bucket that names a texture. */
 function textureProfileFromRaw(raw, variants) {
+    if (raw.classification === TEXTURE_CLASS_BLACK_HOLE) {
+        return textureBlackHoleProfile(raw, variants)
+    }
     const quantum = TEXTURE_FRACTION_BUCKETS
     const qGas = Math.round(raw.gas * quantum)
     const qIce = Math.round(raw.ice * quantum)
@@ -573,8 +762,46 @@ function textureProfileFromRaw(raw, variants) {
         mass: raw.mass,
         seed: raw.seed,
         variant: variant,
+        // Meaningless off a black hole, present so every profile has one shape.
+        eddington: 0,
+        diskTemperature: 0,
         key: raw.classification + ':' + qGas + '.' + qIce + '.' + qRock + '.' + qMetal +
             ':' + qTemp + ':' + qMass + ':' + variant
+    }
+}
+
+/**
+ * The bucketed profile of a black hole.
+ *
+ * Composition is dropped entirely - it says nothing about a horizon, and
+ * letting it into the key would regenerate the disk every time an accreting
+ * hole's bookkeeping fractions twitched. What is left is the peak disk
+ * temperature (which already folds in mass and accretion rate, so it is the one
+ * number that sets the colour) and the Eddington ratio (which sets how bright
+ * the disk is drawn at that colour). The 'blackHole:' prefix keeps the key out
+ * of every other class's namespace exactly as 'star:' does, so a black hole and
+ * a star can never share a cache entry however their numbers land.
+ */
+function textureBlackHoleProfile(raw, variants) {
+    const eddington = textureEddingtonRatio(raw.mass, raw.luminosity)
+    const diskTemperature = textureDiskPeakTemperature(raw.mass, raw.luminosity)
+    const qTemp = Math.round(Math.log(diskTemperature) / Math.log(TEXTURE_TEMPERATURE_RATIO))
+    // Half a decade per bucket, so the whole 1e-4..1 range is nine of them.
+    const qEddington = Math.round(Math.log10(eddington) * 2)
+    const variant = variants > 1 ? (raw.seed % variants) : 0
+    return {
+        classification: TEXTURE_CLASS_BLACK_HOLE,
+        gas: 0,
+        ice: 0,
+        rock: 0,
+        metal: 0,
+        temperature: 0,
+        mass: raw.mass,
+        seed: raw.seed,
+        variant: variant,
+        eddington: eddington,
+        diskTemperature: diskTemperature,
+        key: TEXTURE_CLASS_BLACK_HOLE + ':' + qTemp + ':' + qEddington + ':' + variant
     }
 }
 
@@ -652,6 +879,21 @@ function texturePaletteFor(profile) {
     const rock = profile.rock
     const metal = profile.metal
     const solid = rock + metal + ice
+
+    if (cls === TEXTURE_CLASS_BLACK_HOLE) {
+        // The horizon is black, and that is not a stylisation: no light leaves
+        // it, so there is no colour to choose. `accent` is the accretion disk's
+        // peak colour, which is the only colour a black hole actually has, and
+        // it is what tints the photon ring.
+        const rgb = textureBlackbodyRgb(profile.diskTemperature ||
+            TEXTURE_BH_ANCHOR_TEMPERATURE)
+        return {
+            kind: 'blackHole',
+            lowR: 0, lowG: 0, lowB: 0,
+            highR: 0, highG: 0, highB: 0,
+            accentR: rgb.r, accentG: rgb.g, accentB: rgb.b
+        }
+    }
 
     if (cls === TEXTURE_CLASS_STAR) {
         const rgb = textureBlackbodyRgb(profile.temperature || 5772)
@@ -1150,16 +1392,57 @@ function textureDrawStar(context, width, height, profile, palette) {
 }
 
 /**
- * Ring system texture.
+ * Rasterise a radially-symmetric annulus into a square RGBA image.
  *
  * RingGeometry in r147 uses PLANAR uvs - uv = (vertex.xy / outerRadius + 1)/2 -
- * not radial ones, so this has to be a square image of concentric rings rather
- * than a 1D radial strip. The alpha channel carries the gaps.
+ * not radial ones, so anything drawn on a ring has to be a square image of
+ * concentric circles rather than a 1D radial strip. Ring systems and black hole
+ * accretion disks are therefore literally the same problem, and this is the one
+ * place it is solved: four lookup tables indexed by distance from the centre,
+ * one square root and one integer index per pixel.
+ *
+ * `modulate`, when supplied, is (radius, dx, dy) -> multiplier on the COLOUR
+ * only, and is the only thing in here allowed to depend on the angle. It is
+ * null for ring systems, which keeps that path exactly as fast as it was.
  */
-function textureDrawRings(context, size, profile, palette, innerFraction) {
+function textureRasterizeAnnulus(context, size, alphaLut, redLut, greenLut, blueLut, modulate) {
     const half = size / 2
+    const samples = alphaLut.length
     const image = context.createImageData(size, size)
     const data = image.data
+
+    for (let y = 0; y < size; y++) {
+        const dy = (y + 0.5 - half) / half
+        const dy2 = dy * dy
+        const row = y * size
+        for (let x = 0; x < size; x++) {
+            const dx = (x + 0.5 - half) / half
+            const radius = Math.sqrt(dx * dx + dy2)
+            const offset = (row + x) * 4
+            if (radius >= 1) {
+                data[offset + 3] = 0
+                continue
+            }
+            const index = (radius * samples) | 0
+            const alpha = alphaLut[index]
+            if (!(alpha > 0)) {
+                data[offset + 3] = 0
+                continue
+            }
+            const scale = modulate ? modulate(radius, dx, dy) : 1
+            data[offset] = textureClamp(redLut[index] * scale, 0, 255)
+            data[offset + 1] = textureClamp(greenLut[index] * scale, 0, 255)
+            data[offset + 2] = textureClamp(blueLut[index] * scale, 0, 255)
+            data[offset + 3] = alpha * 255
+        }
+    }
+    context.putImageData(image, 0, 0)
+}
+
+/**
+ * Ring system texture. The alpha channel carries the gaps.
+ */
+function textureDrawRings(context, size, profile, palette, innerFraction) {
     const random = textureRandom(profile.seed ^ 0x2c9277b5)
 
     // A handful of ringlet groups: centre, width, opacity.
@@ -1174,11 +1457,13 @@ function textureDrawRings(context, size, profile, palette, innerFraction) {
     }
 
     // The ring is radially symmetric, so its whole appearance is a function of
-    // one variable. Build it once at 1024 samples and the pixel loop becomes a
-    // square root and a table lookup.
-    const samples = 1024
-    const profileAlpha = new Float32Array(samples)
-    const profileShade = new Float32Array(samples)
+    // one variable. Build it once and let the rasteriser do lookups.
+    const samples = TEXTURE_ANNULUS_SAMPLES
+    const alpha = new Float32Array(samples)
+    const red = new Float32Array(samples)
+    const green = new Float32Array(samples)
+    const blue = new Float32Array(samples)
+
     for (let i = 0; i < samples; i++) {
         const radius = (i + 0.5) / samples
         if (radius < innerFraction || radius > 1) {
@@ -1194,36 +1479,175 @@ function textureDrawRings(context, size, profile, palette, innerFraction) {
         // Fade at both edges so the ring does not end on a hard line.
         density *= textureStep(radius, innerFraction, innerFraction + 0.06) *
             (1 - textureStep(radius, 0.9, 1))
-        profileAlpha[i] = textureClamp(density, 0, 1)
-        profileShade[i] = 0.55 + 0.45 * profileAlpha[i]
+        const value = textureClamp(density, 0, 1)
+        if (!(value > 0)) {
+            continue
+        }
+        const shade = 0.55 + 0.45 * value
+        alpha[i] = value
+        red[i] = textureClamp(textureMix(palette.lowR, palette.highR, shade) * 1.05, 0, 255)
+        green[i] = textureClamp(textureMix(palette.lowG, palette.highG, shade) * 1.02, 0, 255)
+        blue[i] = textureClamp(textureMix(palette.lowB, palette.highB, shade), 0, 255)
     }
 
-    for (let y = 0; y < size; y++) {
-        const dy = (y + 0.5 - half) / half
-        const dy2 = dy * dy
-        const row = y * size
-        for (let x = 0; x < size; x++) {
-            const dx = (x + 0.5 - half) / half
-            const radius = Math.sqrt(dx * dx + dy2)
-            const offset = (row + x) * 4
-            if (radius >= 1) {
-                data[offset + 3] = 0
-                continue
-            }
-            const index = (radius * samples) | 0
-            const alpha = profileAlpha[index]
-            if (!(alpha > 0)) {
-                data[offset + 3] = 0
-                continue
-            }
-            const shade = profileShade[index]
-            data[offset] = textureClamp(textureMix(palette.lowR, palette.highR, shade) * 1.05, 0, 255)
-            data[offset + 1] = textureClamp(textureMix(palette.lowG, palette.highG, shade) * 1.02, 0, 255)
-            data[offset + 2] = textureClamp(textureMix(palette.lowB, palette.highB, shade), 0, 255)
-            data[offset + 3] = alpha * 255
+    textureRasterizeAnnulus(context, size, alpha, red, green, blue, null)
+}
+
+/**
+ * Accretion disk texture for one annulus of a black hole's disk.
+ *
+ * `innerFraction` is the hole in the planar uv square - inner geometry radius
+ * over outer geometry radius, exactly as for a ring system - and `outerIsco` is
+ * that outer geometry radius measured in ISCOs, so a texture radius q sits at
+ * x = q * outerIsco in the temperature profile.
+ *
+ * COLOUR is the blackbody colour of the LOCAL disk temperature: hottest and
+ * bluest just outside the ISCO, falling outward as roughly r^(-3/4) through
+ * white and orange toward red. That is the real behaviour of a thin disk, and
+ * it is the whole reason a black hole is worth drawing at all.
+ *
+ * BRIGHTNESS is baked into the rgb rather than carried in the alpha channel.
+ * The material blends additively, and three.js's premultiplied-alpha path -
+ * which is the renderer default - implements AdditiveBlending as
+ * blendFunc(ONE, ONE), where the alpha channel does nothing whatsoever. Baking
+ * it in is correct under both blend paths.
+ *
+ * The azimuthal structure is a trailing spiral plus one octave of value noise.
+ * Real disks are turbulent and really do carry spiral density waves, and the
+ * pitch tightens inward, which is what differential rotation does to any
+ * pattern in the flow. `arms` must stay an INTEGER or the pattern tears open
+ * along atan2's branch cut.
+ *
+ * THE TWO ANNULI HAVE TO AGREE WHERE THEY MEET. They are separate textures with
+ * separate uv scales, so every radial quantity in here is computed in PHYSICAL
+ * units - x, in ISCOs - rather than in texture units, and both are seeded from
+ * the same profile. Do that and the temperature, the spiral and the clumping
+ * are all continuous across the join; skip it and there is a visible step at
+ * TEXTURE_BH_DISK_SPLIT. `fadeOuter` is there for the same reason: only the
+ * OUTERMOST annulus may fade out at its rim.
+ *
+ * NOT MODELLED, deliberately: relativistic beaming, which brightens and blues
+ * the side of the disk approaching the observer. It lives in the OBSERVER's
+ * frame, so it cannot be baked into a texture that rotates with the gas; like
+ * the lensing, it would need a shader.
+ */
+function textureDrawAccretionDisk(context, size, profile, innerFraction, outerIsco, fadeOuter) {
+    const samples = TEXTURE_ANNULUS_SAMPLES
+    const alpha = new Float32Array(samples)
+    const red = new Float32Array(samples)
+    const green = new Float32Array(samples)
+    const blue = new Float32Array(samples)
+    // log(radius) depends on radius alone, so the spiral's radial term goes in
+    // a table and the per-pixel cost is one atan2 and one noise lookup.
+    const spiral = new Float32Array(samples)
+
+    const seed = (profile && isFinite(profile.seed)) ? (profile.seed | 0) : 0
+    const peak = textureClamp(textureNumber(profile && profile.diskTemperature,
+        TEXTURE_BH_ANCHOR_TEMPERATURE), TEXTURE_BH_MIN_TEMPERATURE,
+        TEXTURE_BH_MAX_TEMPERATURE)
+    const eddington = textureClamp(textureNumber(profile && profile.eddington,
+        TEXTURE_BH_DEFAULT_EDDINGTON), TEXTURE_BH_MIN_EDDINGTON, 1)
+    // An actively feeding hole is drawn brighter. The quarter power is the same
+    // one that set the temperature, so a disk that turns blue also turns up.
+    const gain = TEXTURE_BH_DISK_GAIN * textureClamp(
+        Math.pow(eddington / TEXTURE_BH_DEFAULT_EDDINGTON, 0.25), 0.45, 1.35) / 255
+
+    const random = textureRandom(seed ^ 0x6ba1c3e7)
+    const arms = 2 + Math.floor(random() * 2)
+    const phase = random() * Math.PI * 2
+    const pitch = -(2.6 + random() * 1.8)
+    const clumpFrequency = 0.9 + random() * 0.6
+    const clumpSeed = (seed ^ 0x1d2e3f40) | 0
+
+    for (let i = 0; i < samples; i++) {
+        const q = (i + 0.5) / samples
+        const x = q * outerIsco
+        spiral[i] = pitch * Math.log(x > 1e-6 ? x : 1e-6)
+        if (q < innerFraction || q > 1) {
+            continue
         }
+        const shape = textureDiskTemperatureShape(x)
+        if (!(shape > 0)) {
+            continue
+        }
+        const rgb = textureBlackbodyRgb(peak * shape)
+        // Surface brightness goes as T^4, which is far too steep to survive an
+        // 8-bit texture - it would leave one bright line and nothing else. The
+        // square keeps the inner disk clearly dominant without erasing
+        // everything past a couple of ISCOs.
+        let brightness = shape * shape * gain
+        // Fade the outer rim so the disk does not end on a drawn circle - but
+        // only where the disk actually ends, or the join tears open.
+        if (fadeOuter) {
+            brightness *= 1 - textureStep(q, 0.88, 1)
+        }
+        if (!(brightness > 0)) {
+            continue
+        }
+        red[i] = rgb.r * brightness
+        green[i] = rgb.g * brightness
+        blue[i] = rgb.b * brightness
+        alpha[i] = 1
     }
-    context.putImageData(image, 0, 0)
+
+    textureRasterizeAnnulus(context, size, alpha, red, green, blue,
+        function (radius, dx, dy) {
+            const index = (radius * samples) | 0
+            const arm = textureSin(arms * Math.atan2(dy, dx) + spiral[index] + phase) *
+                0.5 + 0.5
+            // Physical coordinates again, so both annuli sample one noise field.
+            const scale = clumpFrequency * outerIsco
+            const clump = textureValueNoise3(dx * scale, dy * scale,
+                radius * outerIsco * 0.5, clumpSeed)
+            return textureClamp(0.58 + 0.5 * arm + 0.34 * (clump - 0.5), 0, 1.45)
+        })
+}
+
+/**
+ * The photon ring.
+ *
+ * THIS IS A SUGGESTION OF GRAVITATIONAL LENSING, NOT A COMPUTATION OF IT.
+ * Real lensing means integrating null geodesics per pixel in a shader, and
+ * nothing in this file does that. What is drawn instead is the single feature
+ * that carries almost all of the recognisability: light on orbits near the
+ * photon sphere piles up into a thin bright circle at sqrt(27)/2 R_s, and that
+ * circle is the rim of the black shadow. A gaussian band of additive light at
+ * exactly that radius, sitting on the edge of a dark halo that eats the
+ * background, reads as a lensed black hole and costs one small texture and one
+ * draw call. It does not bend anything, and it never claims to.
+ */
+function textureDrawPhotonRing(context, size, palette) {
+    const samples = TEXTURE_ANNULUS_SAMPLES
+    const alpha = new Float32Array(samples)
+    const red = new Float32Array(samples)
+    const green = new Float32Array(samples)
+    const blue = new Float32Array(samples)
+
+    const centre = TEXTURE_BH_SHADOW_RADIUS / TEXTURE_BH_PHOTON_OUTER
+    const width = TEXTURE_BH_PHOTON_WIDTH
+    // Brightened well past the disk's own colour: the ring is light that has
+    // been round the hole and is blueshifted on the way out.
+    const r = textureMix(textureNumber(palette && palette.accentR, 255), 255, 0.45)
+    const g = textureMix(textureNumber(palette && palette.accentG, 255), 255, 0.45)
+    const b = textureMix(textureNumber(palette && palette.accentB, 255), 255, 0.5)
+
+    for (let i = 0; i < samples; i++) {
+        const q = (i + 0.5) / samples
+        if (q > 1) {
+            continue
+        }
+        const d = (q - centre) / width
+        const band = Math.exp(-d * d) * TEXTURE_BH_PHOTON_BRIGHTNESS
+        if (!(band > 0.004)) {
+            continue
+        }
+        alpha[i] = 1
+        red[i] = r * band
+        green[i] = g * band
+        blue[i] = b * band
+    }
+
+    textureRasterizeAnnulus(context, size, alpha, red, green, blue, null)
 }
 
 // ============================================================================
@@ -1353,6 +1777,32 @@ class BodyTextureLibrary {
         return this.ringsEnabled && textureBodyHasRings(this.profileFor(planet))
     }
 
+    /** Whether this body is a black hole. Pure, and safe without THREE. */
+    isBlackHole(planet) {
+        return textureIsBlackHole(planet)
+    }
+
+    /**
+     * Everything needed to draw a black hole's accretion disk, photon ring and
+     * shadow, or null for anything that is not a black hole.
+     *
+     * Returns the cached, shared materials - never copies - so a hundred black
+     * holes in the same bucket cost one set. DetailBodyPool owns the geometry;
+     * this owns the pixels.
+     *
+     *   {innerMaterial, outerMaterial, photonMaterial, innerSpin, outerSpin}
+     *
+     * innerSpin / outerSpin are angular rates in rad/s, and their ratio is the
+     * genuine Keplerian one for the two annuli.
+     */
+    accretionDiskFor(planet) {
+        if (!textureIsBlackHole(planet)) {
+            return null
+        }
+        const entry = this._entryFor(planet)
+        return (entry && entry.disk) ? entry.disk : null
+    }
+
     _entryFor(planet) {
         if (!this.available) {
             return null
@@ -1378,6 +1828,9 @@ class BodyTextureLibrary {
 
     /** Build one texture + material pair. Returns null on any failure. */
     _generate(profile) {
+        if (profile.classification === TEXTURE_CLASS_BLACK_HOLE) {
+            return this._generateBlackHole(profile)
+        }
         const width = this.size
         const height = this.height
         const canvas = textureCreateCanvas(width, height)
@@ -1502,6 +1955,185 @@ class BodyTextureLibrary {
         }
     }
 
+    /**
+     * Build a black hole's cache entry.
+     *
+     * There is no body texture in the usual sense and there cannot be: an event
+     * horizon has no surface, so there is nothing for an equirectangular map to
+     * be a map OF. The 8x8 black canvas exists only so textureFor() keeps its
+     * contract of returning a texture wherever materialFor() returns a
+     * material; the material itself carries no map at all, because the honest
+     * answer for a horizon is an unlit, untinted, pure black surface.
+     */
+    _generateBlackHole(profile) {
+        const started = textureNow()
+        const palette = texturePaletteFor(profile)
+        const canvas = textureCreateCanvas(8, 8)
+        const context = textureContextOf(canvas)
+        if (!context) {
+            this.available = false
+            return null
+        }
+        try {
+            const image = context.createImageData(8, 8)
+            const data = image.data
+            for (let i = 0; i < data.length; i += 4) {
+                data[i + 3] = 255
+            }
+            context.putImageData(image, 0, 0)
+        } catch (e) { /* a canvas that stayed transparent is still not white */ }
+
+        let texture = null
+        let material = null
+        try {
+            texture = new THREE.CanvasTexture(canvas)
+            texture.needsUpdate = true
+            // Basic, not Lambert: the scene's point light must not be able to
+            // put a highlight on an event horizon. Out of the tone mapping too,
+            // so no exposure curve can lift it off zero.
+            material = new THREE.MeshBasicMaterial({
+                color: 0x000000,
+                fog: false,
+                toneMapped: false
+            })
+        } catch (e) {
+            return null
+        }
+
+        const disk = this._generateAccretionDisk(profile, palette)
+        this.stats.generated++
+        this.stats.totalMs += textureNow() - started
+
+        return {
+            profile: profile,
+            palette: palette,
+            texture: texture,
+            material: material,
+            // A black hole never carries a ring system; textureBodyHasRings
+            // already says so, this makes it explicit for the disposer.
+            ringTexture: null,
+            disk: disk,
+            used: 0
+        }
+    }
+
+    /**
+     * The three additive layers around the horizon: two disk annuli and the
+     * photon ring. Null if any of them cannot be built, so the caller falls
+     * back to a bare black sphere rather than to half a black hole.
+     */
+    _generateAccretionDisk(profile, palette) {
+        const size = Math.max(128, Math.min(256, this.size))
+        const inner = this._diskTexture(profile, size,
+            TEXTURE_BH_ISCO / TEXTURE_BH_DISK_SPLIT,
+            TEXTURE_BH_DISK_SPLIT / TEXTURE_BH_ISCO, false)
+        const outer = this._diskTexture(profile, size,
+            TEXTURE_BH_DISK_SPLIT / TEXTURE_BH_DISK_OUTER,
+            TEXTURE_BH_DISK_OUTER / TEXTURE_BH_ISCO, true)
+        const photon = this._photonTexture(palette, Math.min(128, size))
+
+        if (!inner || !outer || !photon) {
+            textureDisposeAll([inner, outer, photon])
+            return null
+        }
+        const innerMaterial = this._additiveMaterial(inner)
+        const outerMaterial = this._additiveMaterial(outer)
+        const photonMaterial = this._additiveMaterial(photon)
+        if (!innerMaterial || !outerMaterial || !photonMaterial) {
+            textureDisposeAll([inner, outer, photon, innerMaterial, outerMaterial,
+                photonMaterial])
+            return null
+        }
+        return {
+            innerTexture: inner,
+            outerTexture: outer,
+            photonTexture: photon,
+            innerMaterial: innerMaterial,
+            outerMaterial: outerMaterial,
+            photonMaterial: photonMaterial,
+            // Keplerian: omega ~ r^(-3/2) at each annulus' mid-radius, so the
+            // inner ring really does lap the outer one, by a factor of ~3.5.
+            innerSpin: TEXTURE_BH_INNER_SPIN,
+            outerSpin: TEXTURE_BH_OUTER_SPIN
+        }
+    }
+
+    _diskTexture(profile, size, innerFraction, outerIsco, fadeOuter) {
+        const canvas = textureCreateCanvas(size, size)
+        const context = textureContextOf(canvas)
+        if (!context) {
+            return null
+        }
+        try {
+            textureDrawAccretionDisk(context, size, profile, innerFraction, outerIsco,
+                fadeOuter)
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.error) {
+                console.error('textures: disco de acreção falhou', e)
+            }
+            return null
+        }
+        return this._planarTexture(canvas)
+    }
+
+    _photonTexture(palette, size) {
+        const canvas = textureCreateCanvas(size, size)
+        const context = textureContextOf(canvas)
+        if (!context) {
+            return null
+        }
+        try {
+            textureDrawPhotonRing(context, size, palette)
+        } catch (e) {
+            return null
+        }
+        return this._planarTexture(canvas)
+    }
+
+    /** Canvas -> CanvasTexture for a planar (ring/disk) uv layout. */
+    _planarTexture(canvas) {
+        try {
+            const texture = new THREE.CanvasTexture(canvas)
+            // Planar uvs never leave 0..1, so clamping is right on both axes.
+            texture.wrapS = THREE.ClampToEdgeWrapping
+            texture.wrapT = THREE.ClampToEdgeWrapping
+            texture.anisotropy = this.anisotropy
+            if (THREE.sRGBEncoding !== undefined) {
+                texture.encoding = THREE.sRGBEncoding
+            }
+            texture.needsUpdate = true
+            return texture
+        } catch (e) {
+            return null
+        }
+    }
+
+    /**
+     * Unlit additive material for one of the glowing layers.
+     *
+     * depthWrite is off because these are transparent and overlap each other;
+     * depth TEST stays on so the horizon sphere still occludes the far side of
+     * the disk, which is the one bit of occlusion that has to be right.
+     */
+    _additiveMaterial(texture) {
+        try {
+            const parameters = {
+                map: texture,
+                transparent: true,
+                side: THREE.DoubleSide,
+                depthWrite: false,
+                fog: false,
+                toneMapped: false
+            }
+            if (THREE.AdditiveBlending !== undefined) {
+                parameters.blending = THREE.AdditiveBlending
+            }
+            return new THREE.MeshBasicMaterial(parameters)
+        } catch (e) {
+            return null
+        }
+    }
+
     _generateRingTexture(profile) {
         if (!this.available) {
             return null
@@ -1521,21 +2153,7 @@ class BodyTextureLibrary {
         } catch (e) {
             return null
         }
-        try {
-            const texture = new THREE.CanvasTexture(canvas)
-            // Planar uvs that never leave 0..1, so clamping is correct on both
-            // axes and repeating would only produce artefacts at the edge.
-            texture.wrapS = THREE.ClampToEdgeWrapping
-            texture.wrapT = THREE.ClampToEdgeWrapping
-            texture.anisotropy = this.anisotropy
-            if (THREE.sRGBEncoding !== undefined) {
-                texture.encoding = THREE.sRGBEncoding
-            }
-            texture.needsUpdate = true
-            return texture
-        } catch (e) {
-            return null
-        }
+        return this._planarTexture(canvas)
     }
 
     /**
@@ -1629,7 +2247,20 @@ function textureDisposeEntry(entry) {
     if (!entry) {
         return
     }
-    const items = [entry.texture, entry.ringTexture, entry.material]
+    textureDisposeAll([entry.texture, entry.ringTexture, entry.material])
+    const disk = entry.disk
+    if (disk) {
+        textureDisposeAll([disk.innerTexture, disk.outerTexture, disk.photonTexture,
+            disk.innerMaterial, disk.outerMaterial, disk.photonMaterial])
+        entry.disk = null
+    }
+}
+
+/** dispose() everything in a list that has one, tolerating nulls. */
+function textureDisposeAll(items) {
+    if (!items) {
+        return
+    }
     for (let i = 0; i < items.length; i++) {
         const item = items[i]
         if (item && typeof item.dispose === 'function') {
@@ -1783,6 +2414,9 @@ function textureSelectDetailed(candidates, count, options) {
  *   hysteresis {number}  incumbency bonus. Default 1.5.
  *   generationsPerFrame {number} new textures generated per update. Default 1.
  *   rings     {boolean}  draw ring systems. Default true.
+ *   blackHoles {boolean} draw accretion disks, photon rings and shadows around
+ *                        black holes. Default true. With it off a black hole is
+ *                        still black - it just has nothing around it.
  *   rotate    {boolean}  cosmetic spin. Default true. SEE BELOW.
  *   rotationSpeed {number} radians per second at the reference size. Default 0.25.
  *   skipStars {boolean}  never detail a body main.js already draws with its own
@@ -1795,6 +2429,11 @@ function textureSelectDetailed(candidates, count, options) {
  * slow turn applied here exists only so that a textured body reads as a sphere
  * rather than as a decal, and the same goes for the ring plane's tilt. Set
  * `rotate: false` (or call setRotationEnabled(false)) to remove it entirely.
+ *
+ * The one exception is the accretion disk of a black hole. Its absolute rate is
+ * cosmetic like everything else here, but the RATIO between its two annuli is
+ * the real Keplerian omega ~ r^(-3/2), so the inner ring genuinely laps the
+ * outer one and the disk shears the way a disk does.
  */
 class DetailBodyPool {
 
@@ -1811,6 +2450,7 @@ class DetailBodyPool {
         this.generationsPerFrame = (config.generationsPerFrame >= 0)
             ? Math.floor(config.generationsPerFrame) : 1
         this.ringsEnabled = config.rings !== false
+        this.blackHolesEnabled = config.blackHoles !== false
         this.rotationEnabled = config.rotate !== false
         this.rotationSpeed = (typeof config.rotationSpeed === 'number' && config.rotationSpeed >= 0)
             ? config.rotationSpeed : 0.25
@@ -1834,6 +2474,13 @@ class DetailBodyPool {
 
         this._geometry = null
         this._ringGeometry = null
+        // Built lazily: most runs never contain a black hole and should not pay
+        // for four geometries and a material that nothing will ever draw.
+        this._diskInnerGeometry = null
+        this._diskOuterGeometry = null
+        this._photonGeometry = null
+        this._shadowGeometry = null
+        this._shadowMaterial = null
         this._group = null
 
         if (this.available) {
@@ -1948,14 +2595,16 @@ class DetailBodyPool {
         this._pickables.length = 0
         this.byPlanet.clear()
 
-        if (this._geometry && typeof this._geometry.dispose === 'function') {
-            try { this._geometry.dispose() } catch (e) { /* ignore */ }
-        }
-        if (this._ringGeometry && typeof this._ringGeometry.dispose === 'function') {
-            try { this._ringGeometry.dispose() } catch (e) { /* ignore */ }
-        }
+        textureDisposeAll([this._geometry, this._ringGeometry,
+            this._diskInnerGeometry, this._diskOuterGeometry, this._photonGeometry,
+            this._shadowGeometry, this._shadowMaterial])
         this._geometry = null
         this._ringGeometry = null
+        this._diskInnerGeometry = null
+        this._diskOuterGeometry = null
+        this._photonGeometry = null
+        this._shadowGeometry = null
+        this._shadowMaterial = null
 
         if (this._group && this.scene && typeof this.scene.remove === 'function') {
             try { this.scene.remove(this._group) } catch (e) { /* ignore */ }
@@ -1980,6 +2629,14 @@ class DetailBodyPool {
             } catch (e) { /* a broken predicate must not veto everything */ }
         }
         if (!this.skipStars) {
+            return false
+        }
+        // A black hole is never one of the bodies main.js already draws as a
+        // star: there is no photosphere over there and no halo, and the star
+        // flags may well still be set on it by the physics that collapsed it.
+        // An explicit `skip` predicate above still wins, so main.js keeps the
+        // final say.
+        if (textureIsBlackHole(planet)) {
             return false
         }
         return planet.isStar === true || planet.isCentralStar === true ||
@@ -2139,6 +2796,7 @@ class DetailBodyPool {
         if (slot.ring) {
             slot.ring.visible = false
         }
+        textureHideBlackHole(slot)
     }
 
     _releaseAll() {
@@ -2209,6 +2867,13 @@ class DetailBodyPool {
             if (this.rotationEnabled && slot.spinRate) {
                 slot.mesh.rotation.y += slot.spinRate * dt
             }
+            if (this.rotationEnabled && slot.blackHole && slot.blackHole.group.visible) {
+                // Differential rotation. The absolute rate is showmanship; the
+                // ratio is omega ~ r^(-3/2) and is real, so the inner annulus
+                // laps the outer one and the disk visibly shears.
+                slot.blackHole.inner.rotation.z += slot.blackHole.innerSpin * dt
+                slot.blackHole.outer.rotation.z += slot.blackHole.outerSpin * dt
+            }
 
             this._pickables.push(slot.mesh)
         }
@@ -2233,6 +2898,7 @@ class DetailBodyPool {
         if (this.library && typeof this.library.keyFor === 'function') {
             try { slot.key = this.library.keyFor(planet) } catch (e) { slot.key = null }
         }
+        this._applyBlackHole(slot, planet)
         this._applyRings(slot, planet)
     }
 
@@ -2245,6 +2911,119 @@ class DetailBodyPool {
         slot.mesh.material = slot.fallback
         if (slot.ring) {
             slot.ring.visible = false
+        }
+        textureHideBlackHole(slot)
+    }
+
+    /**
+     * Give a black hole its accretion disk, photon ring and shadow - or take
+     * them away again, because the same slot was very likely holding a planet
+     * ten frames ago and will hold another one ten frames from now.
+     */
+    _applyBlackHole(slot, planet) {
+        let disk = null
+        if (this.blackHolesEnabled && this.library &&
+            typeof this.library.accretionDiskFor === 'function') {
+            try {
+                disk = this.library.accretionDiskFor(planet)
+            } catch (e) {
+                disk = null
+            }
+        }
+        if (!disk) {
+            textureHideBlackHole(slot)
+            return
+        }
+        if (!slot.blackHole) {
+            slot.blackHole = this._createBlackHole()
+            if (!slot.blackHole) {
+                return
+            }
+            slot.group.add(slot.blackHole.group)
+        }
+        const parts = slot.blackHole
+        parts.inner.material = disk.innerMaterial
+        parts.outer.material = disk.outerMaterial
+        parts.photon.material = disk.photonMaterial
+        parts.innerSpin = textureNumber(disk.innerSpin, 0)
+        parts.outerSpin = textureNumber(disk.outerSpin, 0)
+        parts.group.visible = true
+    }
+
+    /**
+     * The four meshes that surround a horizon, in one group tilted into the
+     * body's plane.
+     *
+     * Ordering matters and is set explicitly, because three.js sorts the
+     * transparent pass by renderOrder first and every one of these has its
+     * centre at the same point, so a depth sort has nothing to work with:
+     * shadow, then the outer disk, then the hotter inner disk, then the photon
+     * ring on top. The horizon sphere itself is opaque and writes depth, so it
+     * still occludes the far side of the disk.
+     */
+    _createBlackHole() {
+        try {
+            if (!this._diskInnerGeometry) {
+                this._diskInnerGeometry = new THREE.RingGeometry(
+                    TEXTURE_BH_ISCO, TEXTURE_BH_DISK_SPLIT, 128, 1)
+            }
+            if (!this._diskOuterGeometry) {
+                this._diskOuterGeometry = new THREE.RingGeometry(
+                    TEXTURE_BH_DISK_SPLIT, TEXTURE_BH_DISK_OUTER, 128, 1)
+            }
+            if (!this._photonGeometry) {
+                this._photonGeometry = new THREE.RingGeometry(
+                    TEXTURE_BH_PHOTON_INNER, TEXTURE_BH_PHOTON_OUTER, 128, 1)
+            }
+            if (!this._shadowGeometry) {
+                this._shadowGeometry = new THREE.SphereGeometry(
+                    TEXTURE_BH_SHADOW_RADIUS, 32, 16)
+            }
+            if (!this._shadowMaterial) {
+                // The dark halo. Not additive and not opaque: it multiplies the
+                // background down inside sqrt(27)/2 R_s, which is where a real
+                // hole's shadow falls, and the photon ring lands on its rim.
+                // depthWrite off so it never occludes the disk drawn after it.
+                this._shadowMaterial = new THREE.MeshBasicMaterial({
+                    color: 0x000000,
+                    transparent: true,
+                    opacity: TEXTURE_BH_SHADOW_OPACITY,
+                    depthWrite: false,
+                    fog: false,
+                    toneMapped: false
+                })
+            }
+
+            const group = new THREE.Group()
+            // RingGeometry lies in XY; the body's equator is XZ.
+            group.rotation.x = -Math.PI / 2
+
+            const shadow = new THREE.Mesh(this._shadowGeometry, this._shadowMaterial)
+            const outer = new THREE.Mesh(this._diskOuterGeometry, this._shadowMaterial)
+            const inner = new THREE.Mesh(this._diskInnerGeometry, this._shadowMaterial)
+            const photon = new THREE.Mesh(this._photonGeometry, this._shadowMaterial)
+            const parts = [shadow, outer, inner, photon]
+            for (let i = 0; i < parts.length; i++) {
+                // Same reason as the body mesh: AU-scale distances and a camera
+                // that flies among them make a stale bounding sphere a cull.
+                parts[i].frustumCulled = false
+                parts[i].renderOrder = i
+                // Clicks belong to the body, not to its glow.
+                parts[i].raycast = function () { }
+                group.add(parts[i])
+            }
+
+            return {
+                group: group,
+                shadow: shadow,
+                outer: outer,
+                inner: inner,
+                photon: photon,
+                innerSpin: 0,
+                outerSpin: 0
+            }
+        } catch (e) {
+            return null
         }
     }
 
@@ -2302,6 +3081,7 @@ class DetailBodyPool {
                 group: group,
                 mesh: mesh,
                 ring: null,
+                blackHole: null,
                 fallback: fallback,
                 planet: null,
                 pending: false,
@@ -2350,6 +3130,14 @@ class DetailBodyPool {
             }
             slot.ring = null
         }
+        if (slot.blackHole) {
+            // The geometries and materials belong to the pool and to the
+            // texture library respectively; only the meshes are the slot's.
+            if (slot.group && typeof slot.group.remove === 'function') {
+                try { slot.group.remove(slot.blackHole.group) } catch (e) { /* ignore */ }
+            }
+            slot.blackHole = null
+        }
         if (slot.fallback && typeof slot.fallback.dispose === 'function') {
             try { slot.fallback.dispose() } catch (e) { /* ignore */ }
         }
@@ -2361,9 +3149,23 @@ class DetailBodyPool {
     }
 }
 
+/** Hide a slot's black hole decorations, if it has any. Never throws. */
+function textureHideBlackHole(slot) {
+    if (slot && slot.blackHole && slot.blackHole.group) {
+        slot.blackHole.group.visible = false
+    }
+}
+
 /** Body colour as a CSS string, using whatever the body is willing to tell us. */
 function textureColorOf(planet) {
     if (planet) {
+        // Before anything else. A black hole's colorHex is whatever structure.js
+        // made of a zero luminosity - a composition grey, or a clamped red if
+        // the accretion disk gave it one - and neither is a colour a horizon
+        // has. Black is not a fallback here, it is the answer.
+        if (textureIsBlackHole(planet)) {
+            return '#000000'
+        }
         if (typeof planet.colorHex === 'string' && planet.colorHex) {
             return planet.colorHex
         }
@@ -2403,6 +3205,14 @@ if (typeof module !== 'undefined' && module.exports) {
         textureNoiseField: textureNoiseField,
         textureValueNoise3: textureValueNoise3,
         textureBodyHasRings: textureBodyHasRings,
+        textureRasterizeAnnulus: textureRasterizeAnnulus,
+        textureDrawAccretionDisk: textureDrawAccretionDisk,
+        textureDrawPhotonRing: textureDrawPhotonRing,
+        textureIsBlackHole: textureIsBlackHole,
+        textureEddingtonRatio: textureEddingtonRatio,
+        textureDiskPeakTemperature: textureDiskPeakTemperature,
+        textureDiskTemperatureShape: textureDiskTemperatureShape,
+        textureBlackHoleProfile: textureBlackHoleProfile,
         textureClassOf: textureClassOf,
         textureColorOf: textureColorOf,
         textureRandom: textureRandom,

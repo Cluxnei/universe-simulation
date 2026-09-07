@@ -13,6 +13,15 @@
 // functions and this is a hot path with 800 bodies.
 let PLANET_ID_SEQUENCE = 0
 
+// Give every Composition the black hole marker as a prototype default of false.
+// classify() and radiusFor() read it for all 800 bodies every time a mass
+// changes, and without a default the read would miss the hidden class on every
+// ordinary body. Set here rather than in structure.js only because structure.js
+// is loaded before composition.js and Composition does not exist yet there.
+if (typeof Composition === 'function' && Composition.prototype.isBlackHole === undefined) {
+    Composition.prototype.isBlackHole = false
+}
+
 // --- Local tunables -----------------------------------------------------------
 // These belong in constants.js and should migrate there; this file cannot edit it.
 
@@ -22,7 +31,8 @@ class Planet{
      * The old signature was (position, velocity, radius, density); radius and
      * density are outputs now, not inputs.
      */
-    constructor(position = new Vector(), velocity = new Vector(), mass = 0, composition = null){
+    constructor(position = new Vector(), velocity = new Vector(), mass = 0, composition = null,
+                isBlackHole = false){
         this.id = PLANET_ID_SEQUENCE++
         this.position = position
         this.velocity = velocity
@@ -43,6 +53,19 @@ class Planet{
         // and the body that always wins an accretion against a non-star.
         this.isStar = false
         this.isCentralStar = false
+        // Backing field for the isBlackHole accessor below. Written directly
+        // here because the setter needs this.composition, which exists by now,
+        // but refreshStructure() has not run yet.
+        this._isBlackHole = false
+        // Accretion disk bookkeeping, black holes only. `accretionReservoir` is
+        // mass that has been captured but not yet drained through the disk;
+        // simulation.js turns it into `accretionRate` and then into light.
+        // NONE of this removes mass from the hole - the radiated energy is not
+        // subtracted, so mass conservation stays exact to the last bit.
+        this.accretionReservoir = 0
+        this.accretionRate = 0
+        this.accretionLuminosity = 0
+        this.accretedMass = 0
         // Position in Simulation.stars, or -1. Kept on the body so the force
         // solver can classify 800 planets in one linear pass per step instead
         // of searching the star list for each of them.
@@ -64,6 +87,8 @@ class Planet{
         // dirty flag covers composition changes, which the mass cannot see.
         this.structureMass = -1
         this.structureDirty = true
+        if(isBlackHole || isBlackHoleComposition(this.composition))
+            markBlackHole(this.composition)
         this.refreshStructure()
         this.initialRadius = this.radius
     }
@@ -88,10 +113,13 @@ class Planet{
         this.density = meanDensity(mass, this.radius)
         this.classification = classify(mass, composition)
         this.classLabel = classLabel(this.classification)
+        if(this.classification === CLASS_BLACK_HOLE)
+            return this.refreshBlackHole(mass)
+        this._isBlackHole = false
         this.luminosity = luminosity(mass, this.classification)
         this.effectiveTemperature = effectiveTemperature(this.luminosity, this.radius)
         this.centralTemperature = centralTemperature(mass, this.radius, composition)
-        this.centralPressure = centralPressure(mass, this.radius)
+        this.centralPressure = centralPressure(mass, this.radius, composition)
         this.isLuminous = this.luminosity > 0 &&
             this.effectiveTemperature >= LUMINOUS_MIN_TEMPERATURE
         // Poetic licence lives here and nowhere else: the physical radius above
@@ -110,6 +138,100 @@ class Planet{
         this.structureMass = mass
         this.structureDirty = false
         return this
+    }
+
+    /**
+     * The black hole half of refreshStructure(). Split out so the ordinary path
+     * pays nothing for it beyond one already-computed string comparison.
+     *
+     * Everything a star would derive from its interior is zero here, because
+     * there is no interior: no central temperature, no central pressure, no
+     * surface and therefore no effective temperature and no blackbody colour.
+     * `radius` is the Schwarzschild radius, already computed by radiusFor().
+     *
+     * `luminosity` is NOT zero when the hole is being fed. It carries the
+     * accretion disk's output, in the same solar-luminosity field every other
+     * body uses, so the HUD and the renderer need no special case to see that a
+     * quasar is bright. The hole itself is still black - `isLuminous` stays
+     * false and `colorHex` stays the horizon's colour - because the light comes
+     * from the disk outside the horizon, not from the body.
+     */
+    refreshBlackHole(mass){
+        this._isBlackHole = true
+        // Direct-summed outside the tree, exactly like a star and for exactly
+        // the same reason: it holds most of the mass near it. It is not a claim
+        // that it shines.
+        this.isStar = true
+        this.centralTemperature = 0
+        this.centralPressure = 0
+        this.effectiveTemperature = 0
+        this.luminosity = this.accretionLuminosity
+        this.isLuminous = false
+        this.colorHex = BLACK_HOLE_COLOR_HEX
+        // Capture reach for the collision broad phase: the tidal radius against
+        // a Sun-like victim, which is the right order for anything this
+        // simulation can build, times a margin for low-density victims. The
+        // exact pairwise radius is recomputed per collision candidate in
+        // simulation.js; this only has to be an upper bound for grid sizing.
+        // ACCRETION_RADIUS_FACTOR is deliberately not used - 800 times a 2e-8 AU
+        // horizon is still 1.6e-5 AU and would never catch anything.
+        this.accretionRadius = BLACK_HOLE_CAPTURE_MARGIN *
+            blackHoleCaptureRadius(mass, 1, SOLAR_RADIUS)
+        this.structureMass = mass
+        this.structureDirty = false
+        return this
+    }
+
+    /**
+     * Is this body a black hole?
+     *
+     * Assigning `true` is the supported way to turn any body into one:
+     *
+     *     const hole = new Planet(position, velocity, 10)
+     *     hole.isBlackHole = true
+     *
+     * (or `new Planet(position, velocity, 10, composition, true)`, or
+     * `Planet.blackHole(position, velocity, 10)` - all three do the same thing).
+     * The setter marks the COMPOSITION, which is what classify(), radiusFor()
+     * and describe() key off, and which is what makes the identity survive
+     * accretion: Composition.blend() averages the fraction arrays in place and
+     * never touches the marker, so a hole that swallows a star keeps its own
+     * composition object, keeps the marker, and simply gains the mass. There is
+     * no path back out - a black hole never reclassifies as anything else,
+     * whatever it eats and however heavy it gets.
+     */
+    get isBlackHole(){
+        return this._isBlackHole
+    }
+
+    set isBlackHole(value){
+        const flag = !!value
+        if(flag)
+            markBlackHole(this.composition)
+        else if(this.composition)
+            this.composition.isBlackHole = false
+        this._isBlackHole = flag
+        if(flag)
+            this.isStar = true
+        this.structureDirty = true
+        this.refreshStructure()
+    }
+
+    /** Convenience constructor for scenarios. Mass in Msun. */
+    static blackHole(position, velocity, mass, composition){
+        return new Planet(position, velocity, mass, composition, true)
+    }
+
+    /**
+     * The separation at which this hole would capture `victim`, in AU: the
+     * largest of the pair's tidal radius, this hole's horizon, and the softening
+     * length. Zero for anything that is not a black hole. See
+     * blackHoleCaptureRadius() in structure.js.
+     */
+    captureRadiusFor(victim){
+        if(!this._isBlackHole)
+            return 0
+        return blackHoleCaptureRadius(this.mass, victim.mass, victim.radius)
     }
 
     /** Call after mutating this.composition in place (blend, burn, gas accretion). */
@@ -171,6 +293,15 @@ class Planet{
         this.mass -= given
         if(this.mass < 0)
             this.mass = 0
+        // Everything a black hole ever swallows comes through here, so this is
+        // the one place the accretion disk has to be fed. The mass is already
+        // in the hole; the reservoir is only a record of how recently it
+        // arrived, and simulation.js drains it into light over the disk's
+        // viscous timescale. No mass is removed by radiating.
+        if(receiver._isBlackHole){
+            receiver.accretionReservoir += given
+            receiver.accretedMass += given
+        }
         receiver.markCompositionChanged().refreshStructure()
         this.refreshStructure()
         return given

@@ -46,8 +46,62 @@ const NV_CLASSES = [
     { key: 'planet', label: 'Planetas', singular: 'Planeta' },
     { key: 'gasGiant', label: 'Gigantes gasosos', singular: 'Gigante gasoso' },
     { key: 'brownDwarf', label: 'Anãs marrons', singular: 'Anã marrom' },
-    { key: 'star', label: 'Estrelas', singular: 'Estrela' }
+    { key: 'star', label: 'Estrelas', singular: 'Estrela' },
+    // Not a mass class like the others - a black hole of 10 Msun and a star of
+    // 10 Msun differ by collapse, not by mass - but it belongs at the end of the
+    // list because it is where the sequence ends.
+    { key: 'blackHole', label: 'Buracos negros', singular: 'Buraco negro' }
 ];
+
+/**
+ * Presets for the "Adicionar corpo" tool.
+ *
+ * `min`, `max` and `preset` are in the type's own DISPLAY unit (Earth masses
+ * for the small stuff, Jupiter masses for giants, solar masses for stars),
+ * because nobody types 9.546e-4 for a Jupiter. `composition` is the mix that
+ * lets structure.js classify() agree with the button that was pressed: a body
+ * made of condensed rock has gasFraction 0 and can never be a gas giant, a
+ * brown dwarf or a star, whatever its mass.
+ *
+ * The ranges deliberately straddle each class boundary, so the derived class in
+ * the panel changes under the user's hand instead of being decorative.
+ */
+const NV_SPAWN_TYPES = [
+    {
+        key: 'asteroid', label: 'Asteroide', unit: 'earth',
+        min: 1e-8, max: 1e-3, preset: 1e-5, composition: 'auto',
+        hint: 'Corpo pequeno demais para o equilíbrio hidrostático'
+    },
+    {
+        key: 'planet', label: 'Planeta', unit: 'earth',
+        min: 1e-4, max: 300, preset: 1, composition: 'auto',
+        hint: 'Corpo condensado de rocha, metal e gelo'
+    },
+    {
+        key: 'gasGiant', label: 'Gigante gasoso', unit: 'jupiter',
+        min: 0.02, max: 13, preset: 1, composition: 'nebular',
+        hint: 'Envelope de H/He: precisa de composição nebular e de pelo menos 10 M⊕'
+    },
+    {
+        key: 'brownDwarf', label: 'Anã marrom', unit: 'jupiter',
+        min: 5, max: 80, preset: 30, composition: 'nebular',
+        hint: 'Acima de 13 M♃ o deutério queima'
+    },
+    {
+        key: 'star', label: 'Estrela', unit: 'solar',
+        min: 0.05, max: 50, preset: 1, composition: 'nebular',
+        hint: 'Acima de 0,08 M☉ o hidrogênio queima'
+    }
+];
+
+/** key -> index in NV_SPAWN_TYPES. */
+const NV_SPAWN_TYPE_RANK = (function () {
+    const ranks = Object.create(null);
+    for (let i = 0; i < NV_SPAWN_TYPES.length; i++) {
+        ranks[NV_SPAWN_TYPES[i].key] = i;
+    }
+    return ranks;
+})();
 
 /** key -> index in NV_CLASSES, so classRank() is a lookup and not a scan. */
 const NV_CLASS_RANK = (function () {
@@ -82,6 +136,9 @@ class NavigatorUI {
      *   onOrbitModeChange {Function} ('none'|'ellipses'|'trails'|'both') => void
      *   onOrbitScopeChange {Function} ('selected'|'top12'|'top48'|'all') => void
      *   onChangeScenario {Function} () => void                back to the launch screen
+     *   onSpawnArm     {Function} (armed) => void            ferramenta armada / desarmada
+     *   onSpawnConfigChange {Function} (config) => void      type / mass / composition / velocity
+     *   onSpawnUndo    {Function} () => void                 remove the last body created
      *   maxRows        {number}   default 60
      *   refreshInterval{number}   seconds, default 0.25
      */
@@ -110,6 +167,9 @@ class NavigatorUI {
         this.onOrbitModeChange = options.onOrbitModeChange || null;
         this.onOrbitScopeChange = options.onOrbitScopeChange || null;
         this.onChangeScenario = options.onChangeScenario || null;
+        this.onSpawnArm = options.onSpawnArm || null;
+        this.onSpawnConfigChange = options.onSpawnConfigChange || null;
+        this.onSpawnUndo = options.onSpawnUndo || null;
 
         this.maxRows = options.maxRows || 60;
         this.refreshInterval = options.refreshInterval || 0.25;
@@ -130,6 +190,31 @@ class NavigatorUI {
         this.orbitScope = 'top12';
         this.scenarioLabel = null;
         this.scenarioId = null;
+
+        // --- "Adicionar corpo" tool ---------------------------------------
+        this.spawnArmed = false;
+        this.spawnType = 'planet';
+        this.spawnComposition = 'auto';
+        this.spawnVelocityMode = 'circular';
+        this.spawnUndoCount = 0;
+        // mass per type, in SOLAR masses, so switching types back and forth
+        // does not throw away what the user typed
+        this.spawnMasses = Object.create(null);
+        for (let i = 0; i < NV_SPAWN_TYPES.length; i++) {
+            const spec = NV_SPAWN_TYPES[i];
+            this.spawnMasses[spec.key] = spec.preset * NavigatorUI.spawnUnitFactor(spec.unit);
+        }
+        // what the render layer last told us about the pending placement
+        this.spawnContext = {
+            armed: false, ok: false, hovering: false, plane: 'disk',
+            grazing: false, clamped: false, radius: 0, focusRadius: 0,
+            speed: 0, centralMass: 0, hasFocus: false,
+            starTemperature: 0, starRadius: 0
+        };
+        this._spawnDerivedKey = null;
+        this._spawnDerivedValue = null;
+        this._spawnMassSource = '';
+        this._spawnLastColor = '';
 
         // throttling / fps
         this._accumulator = 0;
@@ -238,6 +323,7 @@ class NavigatorUI {
         root.appendChild(this._buildHud());
         root.appendChild(this._buildBodiesPanel());
         root.appendChild(this._buildInspector());
+        root.appendChild(this._buildSpawnPanel());
         root.appendChild(this._buildPlayback());
         root.appendChild(this._buildHelp());
         root.appendChild(this._buildCrosshair());
@@ -291,6 +377,7 @@ class NavigatorUI {
 
         panel.nvBody = body;
         panel.nvTitle = title;
+        panel.nvToggle = toggle;
         return panel;
     }
 
@@ -855,6 +942,647 @@ class NavigatorUI {
         this.setSpeed(1, false);
         this.setMode('orbit');
         return bar;
+    }
+
+    // --- "Adicionar corpo" tool -------------------------------------------
+    //
+    // The user picks WHAT to create here; WHERE it goes is a click on the 3D
+    // view, resolved by the render layer. Everything shown as "derived" comes
+    // from structure.js describe(), never from the type button that was
+    // pressed: a 5 Earth-mass "gigante gasoso" is a planet and the panel has to
+    // say so, because classify() is what the physics will actually use.
+
+    _spawnHeading(text) {
+        const heading = document.createElement('h3');
+        heading.className = 'nv-spawn__heading';
+        heading.textContent = text;
+        return heading;
+    }
+
+    _buildSpawnPanel() {
+        const panel = this._panel('nv-spawn', 'Adicionar corpo', true);
+        const body = panel.nvBody;
+        const self = this;
+
+        // --- arm / disarm --------------------------------------------------
+        const arm = document.createElement('button');
+        arm.type = 'button';
+        arm.className = 'nv-button nv-button--primary nv-spawn__arm';
+        arm.textContent = 'Armar ferramenta';
+        arm.title = 'Armar e clicar na cena para posicionar o corpo (tecla P)';
+        arm.addEventListener('click', function () {
+            self.toggleSpawnArmed();
+            self._blur(arm);
+        });
+        this.spawnArmButton = arm;
+        body.appendChild(arm);
+
+        // --- type ----------------------------------------------------------
+        body.appendChild(this._spawnHeading('Tipo'));
+        const typeItems = [];
+        for (let i = 0; i < NV_SPAWN_TYPES.length; i++) {
+            const spec = NV_SPAWN_TYPES[i];
+            typeItems.push([spec.key, spec.label, spec.hint]);
+        }
+        this.spawnTypeButtons = {};
+        body.appendChild(this._chipGroup(typeItems, this.spawnTypeButtons, function (key) {
+            self.setSpawnType(key);
+        }));
+
+        // --- mass ----------------------------------------------------------
+        body.appendChild(this._spawnHeading('Massa'));
+
+        const massRow = document.createElement('div');
+        massRow.className = 'nv-spawn__massrow';
+
+        const number = document.createElement('input');
+        number.type = 'number';
+        number.className = 'nv-spawn__number';
+        number.setAttribute('aria-label', 'Massa do corpo a criar');
+        number.addEventListener('input', function () {
+            const parsed = parseFloat(number.value);
+            if (isFinite(parsed) && parsed > 0) {
+                self._setSpawnMassDisplay(parsed, 'number');
+            }
+        });
+        number.addEventListener('change', function () {
+            const parsed = parseFloat(number.value);
+            self._setSpawnMassDisplay(isFinite(parsed) ? parsed : NaN, 'commit');
+        });
+        // the simulation shortcuts live on window; typing must not reach them
+        number.addEventListener('keydown', function (event) {
+            event.stopPropagation();
+        });
+        this.spawnMassInput = number;
+
+        const unit = document.createElement('span');
+        unit.className = 'nv-spawn__unit';
+        this.spawnUnitElement = unit;
+
+        massRow.appendChild(number);
+        massRow.appendChild(unit);
+        body.appendChild(massRow);
+
+        // A logarithmic slider: the useful range of every type spans several
+        // decades, so a linear one would spend 90% of its travel on the top
+        // decade and be unusable for the rest.
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.className = 'nv-spawn__slider';
+        slider.min = '0';
+        slider.max = '1000';
+        slider.step = '1';
+        slider.setAttribute('aria-label', 'Massa do corpo a criar, escala logarítmica');
+        slider.addEventListener('input', function () {
+            const value = parseFloat(slider.value);
+            if (isFinite(value)) {
+                self._setSpawnMass(self._spawnMassFromSlider(value), 'slider');
+            }
+        });
+        slider.addEventListener('keydown', function (event) {
+            event.stopPropagation();
+        });
+        this.spawnMassSlider = slider;
+        body.appendChild(slider);
+
+        const range = document.createElement('p');
+        range.className = 'nv-spawn__range';
+        this.spawnRangeText = range;
+        body.appendChild(range);
+
+        // --- composition ---------------------------------------------------
+        body.appendChild(this._spawnHeading('Composição'));
+        this.spawnCompositionButtons = {};
+        body.appendChild(this._chipGroup([
+            ['auto', 'Automática', 'Condensada no raio de formação: rocha e metal dentro da linha de gelo, gelo fora dela'],
+            ['nebular', 'Nebular (H/He)', 'Mistura solar X=0,71 Y=0,27 - obrigatória para estrelas, anãs marrons e gigantes gasosos']
+        ], this.spawnCompositionButtons, function (key) {
+            self.setSpawnComposition(key);
+        }));
+
+        // --- velocity ------------------------------------------------------
+        body.appendChild(this._spawnHeading('Velocidade inicial'));
+        this.spawnVelocityButtons = {};
+        body.appendChild(this._chipGroup([
+            ['circular', 'Órbita circular', 'Velocidade circular no plano do disco, no mesmo sentido dos corpos existentes'],
+            ['rest', 'Em repouso', 'Velocidade zero no referencial da simulação'],
+            ['radial', 'Queda radial', 'Acompanha a estrela dominante e cai direto sobre ela']
+        ], this.spawnVelocityButtons, function (key) {
+            self.setSpawnVelocityMode(key);
+        }));
+
+        // --- what would actually be created --------------------------------
+        const head = document.createElement('div');
+        head.className = 'nv-spawn__preview';
+
+        const swatch = document.createElement('span');
+        swatch.className = 'nv-swatch';
+        this.spawnSwatch = swatch;
+
+        const badge = document.createElement('span');
+        badge.className = 'nv-badge nv-badge--sm';
+        badge.dataset.class = 'planet';
+        badge.textContent = '—';
+        this.spawnBadge = badge;
+
+        head.appendChild(swatch);
+        head.appendChild(badge);
+        body.appendChild(head);
+
+        const grid = document.createElement('dl');
+        grid.className = 'nv-stats';
+        this.spawnFields = {};
+        this._statRow(grid, this.spawnFields, 'mass', 'Massa', true);
+        this._statRow(grid, this.spawnFields, 'radius', 'Raio');
+        this._statRow(grid, this.spawnFields, 'density', 'Densidade');
+        this._statRow(grid, this.spawnFields, 'luminosity', 'Luminosidade');
+        this._statRow(grid, this.spawnFields, 'temperature', 'Temp. efetiva');
+        this._statRow(grid, this.spawnFields, 'plane', 'Plano do clique');
+        this._statRow(grid, this.spawnFields, 'distance', 'Distância');
+        this._statRow(grid, this.spawnFields, 'speed', 'Velocidade');
+        body.appendChild(grid);
+
+        const hint = document.createElement('p');
+        hint.className = 'nv-spawn__hint';
+        this.spawnHint = hint;
+        body.appendChild(hint);
+
+        const actions = document.createElement('div');
+        actions.className = 'nv-actions';
+        const undo = document.createElement('button');
+        undo.type = 'button';
+        undo.className = 'nv-button';
+        undo.textContent = 'Desfazer';
+        undo.title = 'Remover o último corpo adicionado (Ctrl+Z)';
+        undo.disabled = true;
+        undo.addEventListener('click', function () {
+            if (self.onSpawnUndo) { self.onSpawnUndo(); }
+            self._blur(undo);
+        });
+        this.spawnUndoButton = undo;
+        actions.appendChild(undo);
+        body.appendChild(actions);
+
+        this.spawnPanel = panel;
+        this._applySpawnType(this.spawnType, false);
+        return panel;
+    }
+
+    // --- spawn tool: public API --------------------------------------------
+
+    /** The body the panel currently describes: mass is in SOLAR MASSES. */
+    spawnConfig() {
+        return {
+            type: this.spawnType,
+            mass: this.spawnMassValue(),
+            composition: this.spawnComposition,
+            velocity: this.spawnVelocityMode
+        };
+    }
+
+    /** Configured mass in solar masses. */
+    spawnMassValue() {
+        const mass = this.spawnMasses[this.spawnType];
+        return (typeof mass === 'number' && isFinite(mass) && mass > 0) ? mass : 0;
+    }
+
+    /**
+     * The Composition the body would be created with.
+     *
+     * A star, a brown dwarf or a gas giant MUST get the nebular mix: condensed
+     * rock and ice carry gasFraction 0, and classify() would then refuse to call
+     * a 1 Msun body a star. The type presets choose 'nebular' for those three
+     * for exactly that reason, but the user may override it and the panel says
+     * what the result really is.
+     *
+     * @param {number} [formationRadius] AU, for the automatic composition
+     */
+    buildSpawnComposition(formationRadius) {
+        const radius = this._spawnFormationRadius(formationRadius);
+        try {
+            if (this.spawnComposition !== 'auto' || typeof Composition !== 'function') {
+                return new Composition();
+            }
+            if (typeof Composition.fromFormationRadius !== 'function') {
+                return new Composition();
+            }
+            const context = this.spawnContext;
+            return Composition.fromFormationRadius(
+                radius,
+                context.starTemperature > 0 ? context.starTemperature : 0,
+                context.starRadius > 0 ? context.starRadius : 0
+            );
+        } catch (e) {
+            try {
+                return new Composition();
+            } catch (e2) {
+                return null;
+            }
+        }
+    }
+
+    _spawnFormationRadius(formationRadius) {
+        if (typeof formationRadius === 'number' && isFinite(formationRadius) && formationRadius > 0) {
+            return formationRadius;
+        }
+        const context = this.spawnContext;
+        if (context && context.radius > 0) {
+            return context.radius;
+        }
+        return 1;
+    }
+
+    /**
+     * What structure.js says the configured body would be: class, radius,
+     * density, luminosity, effective temperature and colour.
+     *
+     * Memoised, because the render layer asks for the radius once per frame to
+     * size the ghost marker and describe() runs eight structure functions.
+     */
+    spawnDerived(formationRadius) {
+        const mass = this.spawnMassValue();
+        const radius = this._spawnFormationRadius(formationRadius);
+        // quantise the radius so a moving cursor does not invalidate the cache
+        // on every pixel; 5% steps are far finer than the composition ramp
+        const bucket = (this.spawnComposition === 'auto')
+            ? Math.round(Math.log(radius) * 20)
+            : 0;
+        const key = this.spawnComposition + '|' + mass + '|' + bucket;
+        if (this._spawnDerivedKey === key && this._spawnDerivedValue) {
+            return this._spawnDerivedValue;
+        }
+
+        const composition = this.buildSpawnComposition(radius);
+        let info = null;
+        if (typeof describe === 'function') {
+            try {
+                info = describe(mass, composition);
+            } catch (e) {
+                info = null;
+            }
+        }
+        if (!info) {
+            info = {
+                radius: 0, density: 0, classification: 'asteroid', classLabel: 'Corpo',
+                luminosity: 0, effectiveTemperature: 0, luminous: false
+            };
+        }
+        info.composition = composition;
+        info.colorHex = NavigatorUI.spawnColorOf(info, composition);
+        this._spawnDerivedKey = key;
+        this._spawnDerivedValue = info;
+        return info;
+    }
+
+    /** Blackbody colour for anything that shines, composition colour otherwise. */
+    static spawnColorOf(info, composition) {
+        if (info && info.luminous && info.effectiveTemperature > 0 &&
+            (info.classification === 'star' || info.classification === 'brownDwarf') &&
+            typeof blackbodyColorHex === 'function') {
+            try {
+                const hex = blackbodyColorHex(info.effectiveTemperature);
+                if (typeof hex === 'string' && hex) {
+                    return hex;
+                }
+            } catch (e) { /* fall through */ }
+        }
+        if (composition && typeof composition.displayColor === 'string' && composition.displayColor) {
+            return composition.displayColor;
+        }
+        return '#8899aa';
+    }
+
+    /** Reflect the tool's armed state. Does NOT emit onSpawnArm. */
+    setSpawnArmed(armed) {
+        this.spawnArmed = !!armed;
+        if (this.spawnPanel) {
+            this.spawnPanel.classList.toggle('nv-spawn--armed', this.spawnArmed);
+            // an armed tool the user cannot see is a trap
+            if (this.spawnArmed && this.spawnPanel.classList.contains('nv-panel--collapsed')) {
+                this.spawnPanel.classList.remove('nv-panel--collapsed');
+                if (this.spawnPanel.nvToggle) {
+                    this.spawnPanel.nvToggle.textContent = '−';
+                }
+            }
+        }
+        if (this.root) {
+            this.root.classList.toggle('nv-root--spawning', this.spawnArmed);
+        }
+        this._refreshSpawn();
+        return this;
+    }
+
+    toggleSpawnArmed() {
+        const next = !this.spawnArmed;
+        this.setSpawnArmed(next);
+        if (this.onSpawnArm) {
+            this.onSpawnArm(next);
+        }
+        return this;
+    }
+
+    /**
+     * Everything the render layer knows about the pending placement: where the
+     * ray landed, on which plane, how fast the body would be launched and which
+     * star sets the formation temperature.
+     */
+    setSpawnContext(context) {
+        const target = this.spawnContext;
+        const source = context || {};
+        target.armed = !!source.armed;
+        target.ok = !!source.ok;
+        target.hovering = !!source.hovering;
+        target.plane = (source.plane === 'camera') ? 'camera' : 'disk';
+        target.grazing = !!source.grazing;
+        target.clamped = !!source.clamped;
+        target.radius = NavigatorUI._spawnNumber(source.radius);
+        target.focusRadius = NavigatorUI._spawnNumber(source.focusRadius);
+        target.speed = NavigatorUI._spawnNumber(source.speed);
+        target.centralMass = NavigatorUI._spawnNumber(source.centralMass);
+        target.hasFocus = !!source.hasFocus;
+        target.starTemperature = NavigatorUI._spawnNumber(source.starTemperature);
+        target.starRadius = NavigatorUI._spawnNumber(source.starRadius);
+        this._refreshSpawn();
+        return this;
+    }
+
+    static _spawnNumber(value) {
+        return (typeof value === 'number' && isFinite(value) && value > 0) ? value : 0;
+    }
+
+    /** How many bodies this tool has created and could still take back. */
+    setSpawnUndoCount(count) {
+        this.spawnUndoCount = (typeof count === 'number' && count > 0) ? count : 0;
+        if (this.spawnUndoButton) {
+            this.spawnUndoButton.disabled = this.spawnUndoCount === 0;
+            this.spawnUndoButton.textContent = this.spawnUndoCount > 0
+                ? 'Desfazer (' + this.spawnUndoCount + ')'
+                : 'Desfazer';
+        }
+        return this;
+    }
+
+    setSpawnType(key) {
+        this._applySpawnType(key, true);
+        return this;
+    }
+
+    setSpawnComposition(key) {
+        this.spawnComposition = (key === 'nebular') ? 'nebular' : 'auto';
+        this._spawnDerivedKey = null;
+        this._refreshSpawn();
+        this._emitSpawnConfig();
+        return this;
+    }
+
+    setSpawnVelocityMode(key) {
+        this.spawnVelocityMode = (key === 'rest' || key === 'radial') ? key : 'circular';
+        this._refreshSpawn();
+        this._emitSpawnConfig();
+        return this;
+    }
+
+    _emitSpawnConfig() {
+        if (this.onSpawnConfigChange) {
+            try {
+                this.onSpawnConfigChange(this.spawnConfig());
+            } catch (e) { /* the panel must not depend on the listener */ }
+        }
+    }
+
+    // --- spawn tool: internals ---------------------------------------------
+
+    _spawnSpec() {
+        const rank = NV_SPAWN_TYPE_RANK[this.spawnType];
+        return NV_SPAWN_TYPES[rank === undefined ? 1 : rank];
+    }
+
+    static spawnUnitFactor(unit) {
+        if (unit === 'solar') {
+            return 1;
+        }
+        if (unit === 'jupiter') {
+            return (typeof JUPITER_MASS === 'number' && JUPITER_MASS > 0) ? JUPITER_MASS : 9.546e-4;
+        }
+        return (typeof EARTH_MASS === 'number' && EARTH_MASS > 0) ? EARTH_MASS : 3.003e-6;
+    }
+
+    static spawnUnitLabel(unit) {
+        if (unit === 'solar') {
+            return 'M☉';
+        }
+        if (unit === 'jupiter') {
+            return 'M♃';
+        }
+        return 'M⊕';
+    }
+
+    /** Slider position (0..1000) -> mass in SOLAR masses. */
+    _spawnMassFromSlider(value) {
+        const spec = this._spawnSpec();
+        const factor = NavigatorUI.spawnUnitFactor(spec.unit);
+        let t = value / 1000;
+        if (!(t >= 0)) { t = 0; }
+        if (t > 1) { t = 1; }
+        const display = spec.min * Math.pow(spec.max / spec.min, t);
+        return display * factor;
+    }
+
+    /** Mass in SOLAR masses -> slider position (0..1000). */
+    _spawnSliderFromMass(mass) {
+        const spec = this._spawnSpec();
+        const factor = NavigatorUI.spawnUnitFactor(spec.unit);
+        let display = mass / factor;
+        if (!(display > 0) || !isFinite(display)) {
+            display = spec.preset;
+        }
+        if (display < spec.min) { display = spec.min; }
+        if (display > spec.max) { display = spec.max; }
+        const t = Math.log(display / spec.min) / Math.log(spec.max / spec.min);
+        return Math.round(Math.max(0, Math.min(1, t)) * 1000);
+    }
+
+    /** Set the mass from a value typed in the type's DISPLAY unit. */
+    _setSpawnMassDisplay(display, source) {
+        const spec = this._spawnSpec();
+        let value = display;
+        if (!isFinite(value) || !(value > 0)) {
+            value = spec.preset;
+        }
+        if (source === 'commit') {
+            // only snap back into range once the user has finished typing
+            if (value < spec.min) { value = spec.min; }
+            if (value > spec.max) { value = spec.max; }
+        }
+        this._setSpawnMass(value * NavigatorUI.spawnUnitFactor(spec.unit), source);
+    }
+
+    _setSpawnMass(mass, source) {
+        if (!(mass > 0) || !isFinite(mass)) {
+            return;
+        }
+        this.spawnMasses[this.spawnType] = mass;
+        this._spawnDerivedKey = null;
+        this._spawnMassSource = source || '';
+        this._refreshSpawn();
+        this._spawnMassSource = '';
+        this._emitSpawnConfig();
+    }
+
+    _applySpawnType(key, emit) {
+        const rank = NV_SPAWN_TYPE_RANK[key];
+        if (rank !== undefined) {
+            this.spawnType = key;
+        }
+        const spec = this._spawnSpec();
+        if (!(this.spawnMasses[this.spawnType] > 0)) {
+            this.spawnMasses[this.spawnType] =
+                spec.preset * NavigatorUI.spawnUnitFactor(spec.unit);
+        }
+        // A star made of rock is not a star: the preset picks the composition
+        // that lets classify() agree with the button that was pressed.
+        this.spawnComposition = spec.composition;
+        this._spawnDerivedKey = null;
+        this._refreshSpawn();
+        if (emit) {
+            this._emitSpawnConfig();
+        }
+    }
+
+    /** Number typed into the mass field: short, and never in exponent soup. */
+    static formatSpawnInput(value) {
+        if (!isFinite(value) || value <= 0) {
+            return '';
+        }
+        const rounded = Number(value.toPrecision(4));
+        if (rounded >= 1e-4 && rounded < 1e6) {
+            return String(rounded);
+        }
+        return rounded.toExponential(3);
+    }
+
+    _refreshSpawn() {
+        if (!this.spawnPanel) {
+            return;
+        }
+        const spec = this._spawnSpec();
+        const write = NavigatorUI._writeStat;
+        const context = this.spawnContext;
+
+        // --- controls ------------------------------------------------------
+        if (this.spawnArmButton) {
+            this.spawnArmButton.textContent = this.spawnArmed
+                ? 'Desarmar ferramenta'
+                : 'Armar ferramenta';
+            this.spawnArmButton.classList.toggle('nv-button--warn', this.spawnArmed);
+        }
+        NavigatorUI._markGroup(this.spawnTypeButtons, this.spawnType);
+        NavigatorUI._markGroup(this.spawnCompositionButtons, this.spawnComposition);
+        NavigatorUI._markGroup(this.spawnVelocityButtons, this.spawnVelocityMode);
+
+        const mass = this.spawnMassValue();
+        const factor = NavigatorUI.spawnUnitFactor(spec.unit);
+        if (this.spawnUnitElement) {
+            const label = NavigatorUI.spawnUnitLabel(spec.unit);
+            if (this.spawnUnitElement.textContent !== label) {
+                this.spawnUnitElement.textContent = label;
+            }
+        }
+        // a 10 Hz refresh must not reformat the field under the caret
+        const typing = (typeof document !== 'undefined' &&
+            document.activeElement === this.spawnMassInput);
+        if (this.spawnMassInput && !typing && this._spawnMassSource !== 'number') {
+            const text = NavigatorUI.formatSpawnInput(mass / factor);
+            if (this.spawnMassInput.value !== text) {
+                this.spawnMassInput.value = text;
+            }
+        }
+        if (this.spawnMassSlider && this._spawnMassSource !== 'slider') {
+            const position = String(this._spawnSliderFromMass(mass));
+            if (this.spawnMassSlider.value !== position) {
+                this.spawnMassSlider.value = position;
+            }
+        }
+        if (this.spawnRangeText) {
+            const unitLabel = NavigatorUI.spawnUnitLabel(spec.unit);
+            const text = 'Faixa ' + NavigatorUI.formatSpawnInput(spec.min) + ' a ' +
+                NavigatorUI.formatSpawnInput(spec.max) + ' ' + unitLabel + '.';
+            if (this.spawnRangeText.textContent !== text) {
+                this.spawnRangeText.textContent = text;
+            }
+        }
+
+        // --- what would really be created ----------------------------------
+        const derived = this.spawnDerived(context.radius);
+        const classification = (derived && typeof derived.classification === 'string')
+            ? derived.classification : 'asteroid';
+
+        if (this.spawnBadge) {
+            const label = NavigatorUI.classNameOf(classification);
+            if (this.spawnBadge.textContent !== label) {
+                this.spawnBadge.textContent = label;
+                this.spawnBadge.dataset.class = classification;
+            }
+        }
+        if (this.spawnSwatch) {
+            const color = (derived && derived.colorHex) ? derived.colorHex : '#8899aa';
+            if (this._spawnLastColor !== color) {
+                this.spawnSwatch.style.backgroundColor = color;
+                this._spawnLastColor = color;
+            }
+        }
+
+        write(this.spawnFields.mass, mass > 0 ? NavigatorUI.formatMass(mass) : null);
+        write(this.spawnFields.radius, (derived && derived.radius > 0)
+            ? NavigatorUI.formatRadius(derived.radius) : null);
+        write(this.spawnFields.density, (derived && derived.density > 0)
+            ? NavigatorUI.formatDensity(derived.density) : null);
+        write(this.spawnFields.luminosity, (derived && derived.luminous && derived.luminosity > 0)
+            ? NavigatorUI.formatNumber(derived.luminosity) + ' L☉' : null);
+        write(this.spawnFields.temperature, (derived && derived.luminous)
+            ? NavigatorUI.formatTemperature(derived.effectiveTemperature) : null);
+
+        // --- where the click would land ------------------------------------
+        if (context.ok) {
+            write(this.spawnFields.plane, context.plane === 'camera'
+                ? 'Plano da câmera'
+                : 'Plano do disco');
+            write(this.spawnFields.distance, NavigatorUI.formatAu(context.radius) +
+                (context.clamped ? ' (limitada)' : ''));
+            write(this.spawnFields.speed, context.hasFocus
+                ? NavigatorUI.formatNumber(context.speed) + ' UA/ano'
+                : '0 UA/ano');
+        } else {
+            write(this.spawnFields.plane, null);
+            write(this.spawnFields.distance, null);
+            write(this.spawnFields.speed, null);
+        }
+
+        // --- the one line that explains the current state -------------------
+        let hint;
+        if (!this.spawnArmed) {
+            hint = 'Arme a ferramenta e clique na cena para posicionar. Arrastar continua girando a câmera.';
+        } else if (!context.ok) {
+            hint = 'Passe o cursor sobre a cena: um marcador mostra onde o corpo cairia.';
+        } else if (context.plane === 'camera') {
+            hint = 'Visão de perfil: o disco está quase de lado, então a profundidade vem de um plano voltado para a câmera. Incline a câmera para voltar ao plano do disco.';
+        } else if (!context.hasFocus) {
+            hint = 'Sem estrela dominante: o corpo nasce parado, seja qual for o modo escolhido.';
+        } else if (classification !== this.spawnType) {
+            hint = 'Com esta massa e composição, classify() chama o corpo de ' +
+                NavigatorUI.classNameOf(classification).toLowerCase() + '.';
+        } else if (this.spawnVelocityMode === 'circular') {
+            hint = 'Órbita circular prógrada em torno de ' +
+                NavigatorUI.formatMass(context.centralMass) + ' a ' +
+                NavigatorUI.formatAu(context.focusRadius) + '.';
+        } else if (this.spawnVelocityMode === 'rest') {
+            hint = 'Em repouso: o corpo cai em direção ao centro de massa.';
+        } else {
+            hint = 'Queda radial: o corpo cai direto sobre a estrela dominante.';
+        }
+        if (this.spawnHint && this.spawnHint.textContent !== hint) {
+            this.spawnHint.textContent = hint;
+        }
     }
 
     // --- help overlay ------------------------------------------------------
@@ -2130,6 +2858,7 @@ const NV_CATEGORY_LABELS = {
     multiplo: 'Múltiplas estrelas',
     colisao: 'Colisão',
     aglomerado: 'Aglomerado',
+    'buraco-negro': 'Buraco negro',
     custom: 'Personalizado'
 };
 

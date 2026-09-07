@@ -94,6 +94,10 @@ class Simulation{
         this.collisions = 0
         this.disruptions = 0
         this.absorbedByStar = 0
+        // Stars (and anything else) torn apart and swallowed by a black hole.
+        this.tidalDisruptions = 0
+        this.blackHoleAccretionEnabled = BLACK_HOLE_ACCRETION_ENABLED
+        this.blackHoleAccreted = 0
     }
 
     // ---------------------------------------------------------------- scenarios
@@ -172,7 +176,16 @@ class Simulation{
             if(planet.removed) continue
             planet.isCentralStar = false
             planet.starIndex = -1
-            if(planet.isStar || planet.classification === CLASS_STAR){
+            // Black holes join this list too. Not because they shine - they do
+            // not - but because the list IS the direct-summation set: everything
+            // on it is summed exactly, body by body, outside the Barnes-Hut
+            // tree. A black hole is one of the heaviest bodies in any system
+            // that contains one, and approximating it through the tree would
+            // wreck every orbit around it, for the same reason it would for a
+            // star. Its gravity is in no other way special: same G, same 1/r^2,
+            // same softening, same pair-symmetric accumulation.
+            if(planet.isStar || planet.classification === CLASS_STAR ||
+                planet.classification === CLASS_BLACK_HOLE){
                 planet.isStar = true
                 stars.push(planet)
             }
@@ -283,8 +296,10 @@ class Simulation{
     addPlanet(planet){
         this.planets.push(planet)
         this.accelerationsValid = false
-        // A spawned star has to join the direct-sum set before the next step.
-        if(planet.isStar || planet.classification === CLASS_STAR)
+        // A spawned star, or black hole, has to join the direct-sum set before
+        // the next step.
+        if(planet.isStar || planet.classification === CLASS_STAR ||
+            planet.classification === CLASS_BLACK_HOLE)
             this.refreshStars()
         for(let i = 0; i < this.spawnedListeners.length; i++)
             this.spawnedListeners[i](planet)
@@ -602,6 +617,10 @@ class Simulation{
         if(this.updateGasAccretion(dt))
             this.accelerationsValid = false
         this.updateFusion(dt)
+        // Last, so it has the final word on the luminosity of a black hole that
+        // ate something this step: refreshStructure() zeroes that field, and
+        // anything above can trigger a refresh.
+        this.updateBlackHoleAccretion(dt)
         this.time += dt
         this.steps++
         return this
@@ -747,6 +766,11 @@ class Simulation{
         let burned = false
         for(let i = 0; i < planets.length; i++){
             const planet = planets[i]
+            // CLASS_STAR only, which excludes black holes by construction:
+            // classify() returns 'blackHole' for one at any mass, so burn() is
+            // never called on a body that has no interior to burn in. There is
+            // no fusion inside a black hole, and its composition is a ledger of
+            // what fell in rather than a description of anything.
             if(planet.removed || planet.classification !== CLASS_STAR) continue
             const result = planet.composition.burn(
                 planet.centralTemperature, planet.mass, dt * FUSION_TIME_SCALE)
@@ -757,6 +781,60 @@ class Simulation{
             }
         }
         return burned
+    }
+
+    /**
+     * Accretion luminosity, the brightest engine in the universe.
+     *
+     * A black hole converts up to ~10% of the rest mass of what it swallows into
+     * light - against 0.7% for hydrogen fusion - which is why a quasar outshines
+     * its entire host galaxy from a region the size of the solar system.
+     *
+     * THE HOLE IS STILL BLACK. Nothing leaves the horizon. The light comes from
+     * the accretion disk outside it: matter tidally shredded, circularised, and
+     * heated by viscous friction as it spirals in. So it is reported through the
+     * body's normal `luminosity` field, in solar luminosities, where the HUD and
+     * the renderer already look - while `isLuminous` stays false and the body's
+     * colour stays the horizon's, because the emission has no surface.
+     *
+     * Captured mass does not radiate all at once: it drains out of
+     * `accretionReservoir` on the disk's viscous timescale, so one tidal
+     * disruption becomes a flare that rises in a step and fades over years.
+     *
+     * NO MASS IS LOST. The radiated energy is not subtracted from the hole -
+     * doing so would break the mass conservation check for a term of order
+     * 1e-1 * v^2/c^2 of a swallowed body. The luminosity is bookkeeping on top
+     * of an exactly conservative merge.
+     */
+    updateBlackHoleAccretion(dt){
+        if(!this.blackHoleAccretionEnabled || !(dt > 0)) return false
+        const planets = this.planets
+        // Fraction of the reservoir that drains this step, from the exponential
+        // decay: 1 - exp(-dt/tau), written with expm1 so it stays accurate for
+        // the small dt this simulation actually uses.
+        const drainFraction = -Math.expm1(-dt / BLACK_HOLE_ACCRETION_TIMESCALE)
+        let shining = false
+        for(let i = 0; i < planets.length; i++){
+            const planet = planets[i]
+            if(planet.removed || !planet.isBlackHole) continue
+            const reservoir = planet.accretionReservoir
+            if(!(reservoir > BLACK_HOLE_MIN_ACCRETION_RESERVOIR)){
+                planet.accretionReservoir = 0
+                planet.accretionRate = 0
+                planet.accretionLuminosity = 0
+                planet.luminosity = 0
+                continue
+            }
+            const drained = reservoir * drainFraction
+            planet.accretionReservoir = reservoir - drained
+            planet.accretionRate = drained / dt
+            planet.accretionLuminosity =
+                accretionDiskLuminosity(planet.mass, planet.accretionRate)
+            planet.luminosity = planet.accretionLuminosity
+            this.blackHoleAccreted += drained
+            shining = true
+        }
+        return shining
     }
 
     // ---------------------------------------------------------------- collisions
@@ -858,6 +936,30 @@ class Simulation{
     }
 
     /**
+     * How far `body` reaches toward `other` for the purpose of capture, in AU.
+     *
+     * For everything except a black hole this is the inflated accretion radius,
+     * unchanged. For a black hole it is the pairwise capture radius - the
+     * largest of the pair's tidal disruption radius, the horizon, and the
+     * softening length - because the horizon on its own is useless as a target:
+     * a 10 Msun hole's is 2e-7 AU, and 800 times it is still 1.6e-5 AU, so a
+     * hole using the ordinary rule would never capture anything as long as the
+     * simulation ran. The tidal radius is 0.0100 AU for that same hole against a
+     * Sun-like star, and 0.465 AU for a million-solar-mass one - macroscopic,
+     * and the physically correct place for a star to be destroyed.
+     *
+     * The stored accretionRadius of a hole is an upper bound on this (it uses a
+     * Sun-like victim times BLACK_HOLE_CAPTURE_MARGIN), which is what the
+     * collision grid is sized from, so no pair that can capture is ever missed
+     * by the broad phase.
+     */
+    captureReach(body, other){
+        if(!body.isBlackHole)
+            return body.accretionRadius
+        return blackHoleCaptureRadius(body.mass, other.mass, other.radius)
+    }
+
+    /**
      * Swept (continuous) test against the segment travelled this step, so small
      * fast bodies cannot tunnel through each other, against the ACCRETION radii
      * enhanced by gravitational focusing.
@@ -871,7 +973,7 @@ class Simulation{
      * capture radii larger than the Hill sphere.
      */
     handlePair(a, b){
-        let contact = a.accretionRadius + b.accretionRadius
+        let contact = this.captureReach(a, b) + this.captureReach(b, a)
         if(contact <= 0) return 0
         const vx = a.velocity.x - b.velocity.x
         const vy = a.velocity.y - b.velocity.y
@@ -912,9 +1014,26 @@ class Simulation{
             donor = receiver
             receiver = swap
         }
+        // A BLACK HOLE ALWAYS WINS, whatever the masses. This is what keeps a
+        // hole a hole: the receiver is the body that survives and keeps its
+        // composition object, and the composition is where the black hole
+        // marker lives. Without this rule a 10 Msun hole meeting a 20 Msun star
+        // would be absorbed BY the star and the pair would come out classified
+        // as a star, which is not a thing that can happen. Two black holes fall
+        // through to the mass test above, so the heavier one swallows the
+        // lighter and the result is - necessarily - a black hole.
+        if(donor.isBlackHole && !receiver.isBlackHole){
+            const swap = donor
+            donor = receiver
+            receiver = swap
+        }
         // Erosive regime: an impact far faster than the target's own escape
         // speed excavates material instead of sticking. The escape speed here is
         // the real one, from the physical surface.
+        // For a black hole this can never fire, and pleasingly it needs no
+        // special case to not fire: the escape speed from a Schwarzschild radius
+        // is exactly c by construction, so the test asks whether the impact was
+        // faster than 2.5c. Nothing rebounds off a black hole.
         const targetEscape = escapeSpeed(receiver.mass, receiver.radius)
         if(targetEscape > 0 && impactSpeedSquared >
             FRAGMENTATION_VELOCITY_RATIO * FRAGMENTATION_VELOCITY_RATIO * targetEscape * targetEscape){
@@ -923,6 +1042,20 @@ class Simulation{
         this.collisions++
         if(receiver.isStar)
             this.absorbedByStar++
+        // A tidal disruption event. The victim crossed the radius at which the
+        // hole's tide beats its own self-gravity, so it is not a body any more.
+        //
+        // WHAT HAPPENS TO THE DEBRIS: all of it goes in, and NO fragments are
+        // spawned. A real disruption unbinds about half the star and returns the
+        // rest over months to years; modelling that needs debris bodies, and
+        // this simulation already refuses to spawn fragments in the ordinary
+        // erosive-impact path (see disruptPair) for the same reason - the body
+        // count runs away and the frame rate dies. Swallowing the lot keeps
+        // mass, momentum and every element exactly conserved, which is the
+        // property worth protecting, and the mass that arrives is what drives
+        // the accretion disk's luminosity in updateBlackHoleAccretion().
+        if(receiver.isBlackHole)
+            this.tidalDisruptions++
         donor.mergeInto(receiver)
         donor.removed = true
         return 1
@@ -1194,7 +1327,22 @@ class Simulation{
      * Composition assignment uses the summed field, never this.
      */
     get snowLineRadius(){
-        const star = this.star
+        // Measured from the dominant body that actually SHINES. `this.star` can
+        // be a black hole - it is the heaviest thing on the direct-sum list, and
+        // in a galactic-centre scenario that is exactly what it will be - and a
+        // black hole has effective temperature zero and a radius of order 1e-8
+        // AU, which would put the snow line on top of the singularity.
+        let star = this.star
+        if(star && (star.isBlackHole || !(star.effectiveTemperature > 0))){
+            star = null
+            const stars = this.stars
+            for(let i = 0; i < stars.length; i++){
+                const candidate = stars[i]
+                if(candidate.removed || candidate.isBlackHole) continue
+                if(!(candidate.effectiveTemperature > 0)) continue
+                if(!star || candidate.mass > star.mass) star = candidate
+            }
+        }
         return Composition.snowLineRadius(
             star ? star.effectiveTemperature : SOLAR_EFFECTIVE_TEMPERATURE,
             star ? star.radius : SOLAR_RADIUS
@@ -1214,7 +1362,9 @@ class Simulation{
         let kinetic = 0
         let maxElementIndex = 0
         let mostMassive = null
-        let asteroids = 0, rocky = 0, giants = 0, dwarfs = 0, stars = 0
+        let asteroids = 0, rocky = 0, giants = 0, dwarfs = 0, stars = 0, holes = 0
+        let blackHoleMass = 0
+        let blackHoleLuminosity = 0
         const momentum = new Vector()
         const centerOfMass = new Vector()
         for(let i = 0; i < n; i++){
@@ -1227,6 +1377,11 @@ class Simulation{
             const number = planet.composition.number
             if(number > maxElementIndex) maxElementIndex = number
             switch(planet.classification){
+                case CLASS_BLACK_HOLE:
+                    holes++
+                    blackHoleMass += planet.mass
+                    blackHoleLuminosity += planet.luminosity
+                    break
                 case CLASS_STAR: stars++; break
                 case CLASS_BROWN_DWARF: dwarfs++; break
                 case CLASS_GAS_GIANT: giants++; break
@@ -1247,7 +1402,8 @@ class Simulation{
             planet: rocky,
             gasGiant: giants,
             brownDwarf: dwarfs,
-            star: stars
+            star: stars,
+            blackHole: holes
         }
         const potential = this.computePotentialEnergy(planets)
         const table = typeof PERIODIC_TABLE_ELEMENTS !== 'undefined' ? PERIODIC_TABLE_ELEMENTS : null
@@ -1284,6 +1440,13 @@ class Simulation{
             collisions: this.collisions,
             disruptions: this.disruptions,
             absorbedByStar: this.absorbedByStar,
+            blackHoleCount: holes,
+            blackHoleMass: blackHoleMass,
+            // Total accretion disk luminosity, Lsun. The holes themselves emit
+            // nothing; this is the light of what is falling into them.
+            blackHoleLuminosity: blackHoleLuminosity,
+            tidalDisruptions: this.tidalDisruptions,
+            blackHoleAccreted: this.blackHoleAccreted,
             fusionEnergyReleased: this.fusionEnergyReleased,
             maxElement: table ? table[clamped] : null,
             maxElementIndex: clamped

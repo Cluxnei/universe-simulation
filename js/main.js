@@ -181,7 +181,34 @@ function displayRadius(physicalRadius) {
 }
 
 /** Display radius of a body, tolerating a body without a usable radius. */
+function isBlackHoleBody(planet) {
+    return !!planet && (planet.isBlackHole === true || planet.classification === 'blackHole');
+}
+
+/**
+ * A black hole's horizon spans eight decades of size across the masses we
+ * simulate, and almost all of it sits below the ordinary curve's floor, so a
+ * 10 Msun hole and a pebble would draw identically. Give holes their own gentle
+ * curve on mass so the ordering stays readable.
+ */
+function displayRadiusOfBlackHole(planet) {
+    const scale = positiveOr(typeof RENDER_BLACK_HOLE_RADIUS_SCALE !== 'undefined'
+        ? RENDER_BLACK_HOLE_RADIUS_SCALE : 0, 0.045);
+    const exponent = positiveOr(typeof RENDER_BLACK_HOLE_RADIUS_EXPONENT !== 'undefined'
+        ? RENDER_BLACK_HOLE_RADIUS_EXPONENT : 0, 0.2);
+    const floor = positiveOr(typeof RENDER_BLACK_HOLE_RADIUS_MIN !== 'undefined'
+        ? RENDER_BLACK_HOLE_RADIUS_MIN : 0, 0.045);
+    const ceiling = positiveOr(typeof RENDER_BLACK_HOLE_RADIUS_MAX !== 'undefined'
+        ? RENDER_BLACK_HOLE_RADIUS_MAX : 0, 1.5);
+    const mass = (planet && typeof planet.mass === 'number' && planet.mass > 0) ? planet.mass : 10;
+    const drawn = scale * Math.pow(mass / 10, exponent);
+    return Math.min(Math.max(drawn, floor), ceiling);
+}
+
 function displayRadiusOf(planet) {
+    if (isBlackHoleBody(planet)) {
+        return displayRadiusOfBlackHole(planet);
+    }
     return displayRadius(planet && typeof planet.radius === 'number' ? planet.radius : 0);
 }
 
@@ -346,6 +373,12 @@ function dominantStar() {
 
 /** Colour of a star's own emission: blackbody first, then whatever it says. */
 function starColorHex(star) {
+    // A black hole has no photosphere, so its effectiveTemperature is 0 and a
+    // blackbody lookup would clamp to red. What can shine is the accretion
+    // disk, and only while it is actually being fed.
+    if (isBlackHoleBody(star)) {
+        return '#ffb066';
+    }
     if (star && typeof blackbodyColorHex === 'function') {
         const temperature = star.effectiveTemperature;
         if (typeof temperature === 'number' && isFinite(temperature) && temperature > 0) {
@@ -495,22 +528,42 @@ function syncStars() {
 
         const radius = displayRadiusOf(star);
         visual.core.scale.setScalar(radius);
-        visual.glow.scale.setScalar(radius * 10);
+
+        // A black hole is black. It gets a halo only while its accretion disk is
+        // actually being fed, and the glow tracks how hard - a quiet hole shows
+        // nothing at all, which is the honest picture. The horizon itself is
+        // drawn by the detail pool in textures.js; here the core is only a dark
+        // stand-in that still has to occlude what is behind it.
+        const hole = isBlackHoleBody(star);
+        const fed = hole
+            ? (typeof star.luminosity === 'number' && isFinite(star.luminosity) && star.luminosity > 0)
+            : true;
+        visual.glow.visible = fed;
+        visual.glow.scale.setScalar(radius * (hole ? 4 : 10));
 
         // Colour changes on the fusion timescale: refresh it on a stagger.
         if (visual.colorTimer-- <= 0 || visual.lastHex === '') {
             visual.colorTimer = STAR_COLOR_INTERVAL;
             const hex = starColorHex(star);
-            if (hex !== visual.lastHex) {
+            if (hex !== visual.lastHex || hole) {
                 visual.lastHex = hex;
                 const color = cachedColor(hex);
                 // The halo keeps the honest blackbody hue; the core is the same
                 // hue driven past 1.0 by the emissive boost, which is what makes
                 // a photographed star read as a white disc with a coloured corona.
                 visual.glow.material.color.copy(color);
-                visual.core.material.color.copy(color).multiplyScalar(boost);
+                if (hole) {
+                    // Never boost the core past black: the hole emits nothing.
+                    visual.core.material.color.setRGB(0, 0, 0);
+                } else {
+                    visual.core.material.color.copy(color).multiplyScalar(boost);
+                }
                 if (visual.light) {
-                    visual.light.color.copy(color).lerp(WHITE, 0.6);
+                    if (hole && !fed) {
+                        visual.light.color.setRGB(0, 0, 0);
+                    } else {
+                        visual.light.color.copy(color).lerp(WHITE, 0.6);
+                    }
                 }
             }
         }
@@ -1851,6 +1904,12 @@ function syncInstances() {
         return;
     }
     const planets = (simulation && Array.isArray(simulation.planets)) ? simulation.planets : [];
+    // planets.length is an upper bound on what will be written. The mesh was
+    // sized for the scenario's body count, so a body added by hand can push
+    // past it; ensureBodyCapacity() reallocates rather than letting the loop
+    // below silently drop the newest bodies. It reassigns bodyMesh, so the
+    // capacity is read AFTER it.
+    ensureBodyCapacity(planets.length);
     const capacity = bodyMesh.instanceMatrix.count;
     let written = 0;
 
@@ -1882,6 +1941,1082 @@ function syncInstances() {
     if (bodyMesh.instanceColor) {
         bodyMesh.instanceColor.needsUpdate = true;
     }
+}
+
+// ---------------------------------------------------------------------------
+// InstancedMesh capacity
+// ---------------------------------------------------------------------------
+//
+// buildRun() sizes the InstancedMesh for the scenario's body count plus a small
+// headroom, and an InstancedMesh cannot grow. Adding bodies by hand blows past
+// that headroom eventually, and the failure mode of syncInstances() is SILENT -
+// it simply stops writing instances, so the newest bodies vanish from the
+// screen while still existing in the physics. The mesh is therefore
+// reallocated, geometry and material included, whenever the body count crosses
+// the current capacity.
+
+const BODY_MESH_MAX_CAPACITY = 20000;    // hard ceiling: past this we cap and say so
+let bodyMeshCapped = false;
+
+/**
+ * Swap the InstancedMesh for a larger one. Everything is built before anything
+ * is released, so a failed allocation leaves the previous mesh drawing.
+ * @returns {boolean} true when the mesh now holds `capacity` instances
+ */
+function growBodyMesh(capacity) {
+    const previousMesh = bodyMesh;
+    const previousGeometry = bodyGeometry;
+    const previousMaterial = bodyMaterial;
+    const parent = (previousMesh && previousMesh.parent) ? previousMesh.parent : world;
+
+    let mesh = null;
+    try {
+        mesh = createBodyMesh(capacity);
+    } catch (e) {
+        mesh = null;
+    }
+    if (!mesh) {
+        // createBodyMesh() may have replaced the globals before throwing; put
+        // the working pair back and drop whatever it managed to allocate.
+        if (bodyGeometry !== previousGeometry) {
+            if (bodyGeometry) { bodyGeometry.dispose(); }
+            bodyGeometry = previousGeometry;
+        }
+        if (bodyMaterial !== previousMaterial) {
+            if (bodyMaterial) { bodyMaterial.dispose(); }
+            bodyMaterial = previousMaterial;
+        }
+        return false;
+    }
+
+    bodyMesh = mesh;
+    if (parent) {
+        parent.add(mesh);
+    }
+    if (previousMesh) {
+        if (previousMesh.parent) {
+            previousMesh.parent.remove(previousMesh);
+        }
+        if (typeof previousMesh.dispose === 'function') {
+            previousMesh.dispose();
+        }
+        previousMesh.userData.planetIds = null;
+    }
+    if (previousGeometry && previousGeometry !== bodyGeometry) {
+        previousGeometry.dispose();
+    }
+    if (previousMaterial && previousMaterial !== bodyMaterial) {
+        previousMaterial.dispose();
+    }
+    // the camera controller raycasts against `pickables`, which named the old mesh
+    rebuildPickables();
+    return true;
+}
+
+/**
+ * Make sure the mesh can draw `needed` instances. Grows in chunks so a body
+ * added every few seconds does not reallocate every few seconds.
+ * @returns {boolean} false only when the hard ceiling is in the way
+ */
+function ensureBodyCapacity(needed) {
+    if (!bodyMesh || !(needed > 0)) {
+        return true;
+    }
+    const capacity = bodyMesh.instanceMatrix.count;
+    if (needed <= capacity) {
+        return true;
+    }
+    if (capacity >= BODY_MESH_MAX_CAPACITY) {
+        if (!bodyMeshCapped) {
+            bodyMeshCapped = true;
+            if (ui) {
+                ui.notify('Limite de ' + BODY_MESH_MAX_CAPACITY +
+                    ' corpos desenhados atingido; os excedentes não aparecem.');
+            }
+        }
+        return false;
+    }
+    let target = Math.max(needed + 128, Math.ceil(capacity * 1.5));
+    if (target > BODY_MESH_MAX_CAPACITY) {
+        target = BODY_MESH_MAX_CAPACITY;
+    }
+    if (!growBodyMesh(target)) {
+        return false;
+    }
+    return target >= needed;
+}
+
+// ---------------------------------------------------------------------------
+// "Adicionar corpo": click-to-place tool
+// ---------------------------------------------------------------------------
+//
+// A CLICK IS A RAY, NOT A POINT. The screen gives two coordinates and the world
+// needs three, so the depth is chosen deliberately:
+//
+//   1. the DISK PLANE - the plane through the origin whose normal is the disk
+//      normal (scenario's meta.diskNormal, else the one measured by
+//      resolveDiskNormal). This is the right answer for a disk simulation: the
+//      body lands where the user visually expects it.
+//   2. when the ray is nearly parallel to that plane - an edge-on view - the
+//      intersection races off to infinity, so a plane through the origin FACING
+//      THE CAMERA is used instead and the panel says which plane is in force.
+//
+// Either way the point is clamped to a sane distance from the origin. Both
+// candidate planes pass through the origin, so rescaling a point along its own
+// direction keeps it on the plane - the clamp cannot move the body off the
+// plane the user was aiming at.
+//
+// A BODY SPAWNED AT REST FALLS STRAIGHT INTO THE STAR, so the default velocity
+// is a circular orbit about whatever dominates gravitationally at that point
+// (the same focus the orbit layer draws ellipses around), in the disk plane and
+// prograde with the bodies already there.
+
+// |n . d| below this is an edge-on view: ~7 degrees off the plane.
+const SPAWN_GRAZING_LIMIT = 0.12;
+// Distance clamp, as a multiple of the scene extent.
+const SPAWN_MIN_RADIUS_FACTOR = 0.002;
+const SPAWN_MAX_RADIUS_FACTOR = 4;
+// Click vs drag, matching CameraController's own thresholds exactly.
+const SPAWN_CLICK_MOVE = 6;             // px, |dx| + |dy|
+const SPAWN_CLICK_TIME = 450;           // ms
+const SPAWN_CONTEXT_INTERVAL = 0.1;     // s between pushes into the panel
+const SPAWN_PROGRADE_INTERVAL = 2;      // s between re-measurements of the sense
+const SPAWN_UNDO_LIMIT = 64;
+
+let spawnArmed = false;
+let spawnPointerX = 0;
+let spawnPointerY = 0;
+let spawnPointerInside = false;
+let spawnPointerDown = null;
+
+let spawnGroup = null;
+let spawnGhost = null;
+let spawnGhostGeometry = null;
+let spawnGhostMaterial = null;
+let spawnRing = null;
+let spawnRingGeometry = null;
+let spawnRingMaterial = null;
+let spawnLine = null;
+let spawnLineGeometry = null;
+let spawnLineMaterial = null;
+let spawnLinePositions = null;
+
+let spawnPlaneNormal = new THREE.Vector3(0, 0, 1);
+let spawnProgradeSign = 1;
+let spawnProgradeTimer = 0;
+let spawnContextTimer = 0;
+const spawnUndoStack = [];
+
+const SPAWN_ACCENT = 0x6fd3ff;          // on the disk plane
+const SPAWN_WARN = 0xffc46b;            // on the camera plane (edge-on view)
+
+// Scratch. Nothing in this section allocates once the run is built.
+const _spawnRaycaster = new THREE.Raycaster();
+const _spawnNdc = new THREE.Vector2();
+const _spawnCameraNormal = new THREE.Vector3();
+const _spawnProjected = new THREE.Vector3();
+const _spawnRadial = new THREE.Vector3();
+const _spawnTangent = new THREE.Vector3();
+const _spawnProbe = { position: { x: 0, y: 0, z: 0 } };
+// the axis createCircleGeometry() builds its circle around
+const SPAWN_RING_AXIS = new THREE.Vector3(0, 0, 1);
+
+// Where the click resolved to, and how.
+const spawnPoint = {
+    ok: false,
+    grazing: false,     // the disk plane was unusable and the camera plane took over
+    plane: 'disk',      // 'disk' | 'camera'
+    clamped: false,
+    t: 0,               // distance along the ray
+    x: 0, y: 0, z: 0,
+    radius: 0           // distance from the world origin
+};
+
+// The velocity the body would get, recomputed with the point.
+const spawnVelocity = { x: 0, y: 0, z: 0, speed: 0, centralMass: 0, focusRadius: 0, hasFocus: false };
+
+/**
+ * Intersect a ray with the plane through the ORIGIN whose normal is n.
+ *
+ * Pure arithmetic on plain numbers: no THREE, no allocation, and therefore
+ * testable outside the browser. Writes {ok, grazing, t, x, y, z} into `out`.
+ *
+ *   n . (o + t d) = 0   =>   t = -(n . o) / (n . d)
+ *
+ * `grazing` is reported when |n . d| is small (the ray runs along the plane and
+ * t explodes), when the denominator is exactly zero (parallel), when t is not
+ * finite, or when the intersection is behind the camera.
+ *
+ * @returns {boolean} true when the point is usable
+ */
+function spawnIntersectOriginPlane(ox, oy, oz, dx, dy, dz, nx, ny, nz, out) {
+    out.ok = false;
+    out.grazing = false;
+    out.t = 0;
+    out.x = 0; out.y = 0; out.z = 0;
+
+    const denominator = nx * dx + ny * dy + nz * dz;
+    if (!isFinite(denominator) || Math.abs(denominator) < SPAWN_GRAZING_LIMIT) {
+        out.grazing = true;
+        return false;
+    }
+    const numerator = nx * ox + ny * oy + nz * oz;
+    if (!isFinite(numerator)) {
+        out.grazing = true;
+        return false;
+    }
+    const t = -numerator / denominator;
+    if (!isFinite(t) || t <= 0) {
+        // behind the camera, or the camera sits exactly on the plane
+        out.grazing = true;
+        return false;
+    }
+    out.t = t;
+    out.x = ox + dx * t;
+    out.y = oy + dy * t;
+    out.z = oz + dz * t;
+    if (!isFinite(out.x) || !isFinite(out.y) || !isFinite(out.z)) {
+        out.grazing = true;
+        out.ok = false;
+        return false;
+    }
+    out.ok = true;
+    return true;
+}
+
+/**
+ * Pull a resolved point back into [minRadius, maxRadius] of the origin.
+ *
+ * Both candidate planes pass through the origin, so scaling the point along its
+ * own direction leaves it on the plane. A point at the exact origin has no
+ * direction to scale, so it is pushed out along +x - arbitrary, but finite,
+ * which is the whole point of the clamp.
+ *
+ * Sets out.radius and out.clamped. Pure arithmetic; no THREE.
+ */
+function spawnClampRadius(out, minRadius, maxRadius) {
+    out.clamped = false;
+    let radius = Math.sqrt(out.x * out.x + out.y * out.y + out.z * out.z);
+    if (!isFinite(radius)) {
+        out.ok = false;
+        out.radius = 0;
+        return out;
+    }
+    if (radius <= 0) {
+        out.x = minRadius; out.y = 0; out.z = 0;
+        out.radius = minRadius;
+        out.clamped = true;
+        return out;
+    }
+    let scale = 1;
+    if (radius > maxRadius) {
+        scale = maxRadius / radius;
+        radius = maxRadius;
+        out.clamped = true;
+    } else if (radius < minRadius) {
+        scale = minRadius / radius;
+        radius = minRadius;
+        out.clamped = true;
+    }
+    if (scale !== 1) {
+        out.x *= scale;
+        out.y *= scale;
+        out.z *= scale;
+    }
+    out.radius = radius;
+    return out;
+}
+
+/**
+ * A unit vector tangent to the plane with normal n, at radial direction r.
+ *
+ *   t = normalize(n x r)
+ *
+ * which is the direction of v = omega x r for omega along +n: prograde by
+ * construction, once the sign of n has been matched to the system's angular
+ * momentum (see measureSpawnProgradeSign). When r is parallel to n - a point on
+ * the disk axis - there is no meaningful tangent, so any perpendicular is used.
+ *
+ * Pure arithmetic; writes {x, y, z} into `out` and returns true.
+ */
+function spawnTangentDirection(rx, ry, rz, nx, ny, nz, out) {
+    let tx = ny * rz - nz * ry;
+    let ty = nz * rx - nx * rz;
+    let tz = nx * ry - ny * rx;
+    let length = Math.sqrt(tx * tx + ty * ty + tz * tz);
+    if (!(length > 1e-12) || !isFinite(length)) {
+        // r is (anti)parallel to n: pick the axis least aligned with n and
+        // orthogonalise it, exactly as computeOrbitElements does for a
+        // circular orbit with no periapsis.
+        let ax = 0, ay = 0, az = 0;
+        const anx = Math.abs(nx), any = Math.abs(ny), anz = Math.abs(nz);
+        if (anx <= any && anx <= anz) {
+            ax = 1;
+        } else if (any <= anz) {
+            ay = 1;
+        } else {
+            az = 1;
+        }
+        const dot = ax * nx + ay * ny + az * nz;
+        tx = ax - dot * nx;
+        ty = ay - dot * ny;
+        tz = az - dot * nz;
+        length = Math.sqrt(tx * tx + ty * ty + tz * tz);
+        if (!(length > 1e-12) || !isFinite(length)) {
+            out.x = 1; out.y = 0; out.z = 0;
+            return false;
+        }
+    }
+    out.x = tx / length;
+    out.y = ty / length;
+    out.z = tz / length;
+    return true;
+}
+
+/**
+ * Does the system turn with +spawnPlaneNormal or against it?
+ *
+ * meta.diskNormal is taken verbatim by the simulation and its SIGN is not
+ * guaranteed to follow the angular momentum, so a new body given "prograde"
+ * velocity could end up retrograde and be scattered out within an orbit. The
+ * sense is therefore measured from the bodies that are actually there.
+ *
+ * O(n) and called at most every SPAWN_PROGRADE_INTERVAL seconds while armed.
+ */
+function measureSpawnProgradeSign() {
+    spawnProgradeTimer = SPAWN_PROGRADE_INTERVAL;
+    const planets = (simulation && Array.isArray(simulation.planets)) ? simulation.planets : null;
+    if (!planets || planets.length === 0) {
+        return spawnProgradeSign;
+    }
+    const cx = _starField.count > 0 ? _starField.x : 0;
+    const cy = _starField.count > 0 ? _starField.y : 0;
+    const cz = _starField.count > 0 ? _starField.z : 0;
+    const cvx = _starField.count > 0 ? _starField.vx : 0;
+    const cvy = _starField.count > 0 ? _starField.vy : 0;
+    const cvz = _starField.count > 0 ? _starField.vz : 0;
+
+    let hx = 0, hy = 0, hz = 0;
+    for (let i = 0; i < planets.length; i++) {
+        const planet = planets[i];
+        if (!planet || planet.removed || !planet.position || !planet.velocity) {
+            continue;
+        }
+        if (starSet.has(planet)) {
+            continue;               // a star sits at the focus; it says nothing about the sense
+        }
+        const mass = (typeof planet.mass === 'number' && isFinite(planet.mass) && planet.mass > 0)
+            ? planet.mass : 0;
+        if (mass <= 0) {
+            continue;
+        }
+        const rx = planet.position.x - cx;
+        const ry = planet.position.y - cy;
+        const rz = planet.position.z - cz;
+        const vx = (planet.velocity.x || 0) - cvx;
+        const vy = (planet.velocity.y || 0) - cvy;
+        const vz = (planet.velocity.z || 0) - cvz;
+        hx += mass * (ry * vz - rz * vy);
+        hy += mass * (rz * vx - rx * vz);
+        hz += mass * (rx * vy - ry * vx);
+    }
+    const projection = hx * spawnPlaneNormal.x + hy * spawnPlaneNormal.y + hz * spawnPlaneNormal.z;
+    if (isFinite(projection) && projection !== 0) {
+        spawnProgradeSign = projection < 0 ? -1 : 1;
+    }
+    return spawnProgradeSign;
+}
+
+/** The disk plane normal for this run: the scenario's, else the measured one. */
+function resolveSpawnPlaneNormal(fallbackNormal) {
+    const declared = (simulation && simulation.meta) ? simulation.meta.diskNormal : null;
+    if (declared &&
+        typeof declared.x === 'number' && typeof declared.y === 'number' && typeof declared.z === 'number' &&
+        isFinite(declared.x) && isFinite(declared.y) && isFinite(declared.z)) {
+        spawnPlaneNormal.set(declared.x, declared.y, declared.z);
+        if (spawnPlaneNormal.lengthSq() > 1e-12) {
+            spawnPlaneNormal.normalize();
+            return spawnPlaneNormal;
+        }
+    }
+    if (fallbackNormal && fallbackNormal.lengthSq && fallbackNormal.lengthSq() > 1e-12) {
+        spawnPlaneNormal.copy(fallbackNormal).normalize();
+        return spawnPlaneNormal;
+    }
+    spawnPlaneNormal.set(0, 1, 0);
+    return spawnPlaneNormal;
+}
+
+/**
+ * Resolve the pixel the pointer is over into a world point. Fills `spawnPoint`.
+ * @returns {boolean} true when the point is usable
+ */
+function resolveSpawnPoint(clientX, clientY) {
+    spawnPoint.ok = false;
+    spawnPoint.grazing = false;
+    spawnPoint.plane = 'disk';
+    spawnPoint.clamped = false;
+    spawnPoint.radius = 0;
+
+    if (!camera || !renderer) {
+        return false;
+    }
+    const rect = renderer.domElement.getBoundingClientRect();
+    if (!rect.width || !rect.height) {
+        return false;
+    }
+    // setFromCamera reads camera.matrixWorld, which the renderer only refreshes
+    // at draw time; without this the preview trails the camera by a frame.
+    camera.updateMatrixWorld();
+    _spawnNdc.set(
+        ((clientX - rect.left) / rect.width) * 2 - 1,
+        -((clientY - rect.top) / rect.height) * 2 + 1
+    );
+    _spawnRaycaster.setFromCamera(_spawnNdc, camera);
+    const origin = _spawnRaycaster.ray.origin;
+    const direction = _spawnRaycaster.ray.direction;
+
+    const hit = spawnIntersectOriginPlane(
+        origin.x, origin.y, origin.z,
+        direction.x, direction.y, direction.z,
+        spawnPlaneNormal.x, spawnPlaneNormal.y, spawnPlaneNormal.z,
+        spawnPoint
+    );
+
+    if (!hit) {
+        // Edge-on view: fall back to the plane through the origin that faces
+        // the camera. Its normal is the direction from the origin to the
+        // camera, so the ray meets it almost head-on and the depth is stable.
+        spawnPoint.plane = 'camera';
+        _spawnCameraNormal.copy(camera.position);
+        if (_spawnCameraNormal.lengthSq() < 1e-12) {
+            // camera at the origin: use the direction it is looking along
+            camera.getWorldDirection(_spawnCameraNormal);
+            _spawnCameraNormal.negate();
+        }
+        if (_spawnCameraNormal.lengthSq() < 1e-12) {
+            _spawnCameraNormal.set(0, 0, 1);
+        }
+        _spawnCameraNormal.normalize();
+        const grazed = spawnPoint.grazing;
+        const second = spawnIntersectOriginPlane(
+            origin.x, origin.y, origin.z,
+            direction.x, direction.y, direction.z,
+            _spawnCameraNormal.x, _spawnCameraNormal.y, _spawnCameraNormal.z,
+            spawnPoint
+        );
+        spawnPoint.grazing = grazed;
+        spawnPoint.plane = 'camera';
+        if (!second) {
+            return false;
+        }
+    }
+
+    const extent = positiveOr(sceneRadius, 20);
+    spawnClampRadius(spawnPoint,
+        Math.max(extent * SPAWN_MIN_RADIUS_FACTOR, 1e-4),
+        extent * SPAWN_MAX_RADIUS_FACTOR);
+    return spawnPoint.ok;
+}
+
+/**
+ * Velocity for a body of `mass` placed at the resolved point.
+ *
+ * The focus is the same one the orbit layer draws ellipses around - the whole
+ * star system when the point is far outside it, the locally dominant star
+ * otherwise - so the drawn ellipse and the launch velocity agree by
+ * construction. Fills `spawnVelocity`.
+ *
+ * @param {string} mode 'circular' | 'rest' | 'radial'
+ */
+function resolveSpawnVelocity(mode, mass) {
+    spawnVelocity.x = 0;
+    spawnVelocity.y = 0;
+    spawnVelocity.z = 0;
+    spawnVelocity.speed = 0;
+    spawnVelocity.centralMass = 0;
+    spawnVelocity.focusRadius = 0;
+    spawnVelocity.hasFocus = false;
+
+    if (!spawnPoint.ok) {
+        return spawnVelocity;
+    }
+    _spawnProbe.position.x = spawnPoint.x;
+    _spawnProbe.position.y = spawnPoint.y;
+    _spawnProbe.position.z = spawnPoint.z;
+    const focus = focusFor(_spawnProbe);
+    if (!focus) {
+        return spawnVelocity;           // no star: everything is at rest
+    }
+    spawnVelocity.hasFocus = true;
+    spawnVelocity.centralMass = focus.mass;
+
+    if (mode === 'rest') {
+        spawnVelocity.speed = 0;
+        return spawnVelocity;           // zero in the simulation frame
+    }
+
+    // Everything below is expressed relative to the focus.
+    spawnVelocity.x = focus.vx;
+    spawnVelocity.y = focus.vy;
+    spawnVelocity.z = focus.vz;
+
+    _spawnRadial.set(spawnPoint.x - focus.x, spawnPoint.y - focus.y, spawnPoint.z - focus.z);
+    const radius = _spawnRadial.length();
+    spawnVelocity.focusRadius = radius;
+
+    if (mode !== 'circular' || !(radius > 0) || !(focus.mass > 0)) {
+        // 'radial' is free fall: it starts co-moving with the focus and drops
+        // straight onto it. So does a circular request with no usable focus.
+        spawnVelocity.speed = Math.sqrt(
+            spawnVelocity.x * spawnVelocity.x +
+            spawnVelocity.y * spawnVelocity.y +
+            spawnVelocity.z * spawnVelocity.z);
+        return spawnVelocity;
+    }
+
+    const centralMass = focus.mass + (mass > 0 ? mass : 0);
+    let speed = 0;
+    if (typeof circularOrbitalSpeed === 'function') {
+        speed = circularOrbitalSpeed(radius, centralMass);
+    } else {
+        const gravity = positiveOr(typeof GRAVITATION_CONSTANT !== 'undefined' ? GRAVITATION_CONSTANT : 0,
+            4 * Math.PI * Math.PI);
+        speed = Math.sqrt(gravity * centralMass / radius);
+    }
+    if (!isFinite(speed) || speed <= 0) {
+        spawnVelocity.speed = 0;
+        return spawnVelocity;
+    }
+
+    _spawnRadial.multiplyScalar(1 / radius);
+    spawnTangentDirection(
+        _spawnRadial.x, _spawnRadial.y, _spawnRadial.z,
+        spawnPlaneNormal.x * spawnProgradeSign,
+        spawnPlaneNormal.y * spawnProgradeSign,
+        spawnPlaneNormal.z * spawnProgradeSign,
+        _spawnTangent
+    );
+    spawnVelocity.x += _spawnTangent.x * speed;
+    spawnVelocity.y += _spawnTangent.y * speed;
+    spawnVelocity.z += _spawnTangent.z * speed;
+    spawnVelocity.speed = Math.sqrt(
+        spawnVelocity.x * spawnVelocity.x +
+        spawnVelocity.y * spawnVelocity.y +
+        spawnVelocity.z * spawnVelocity.z);
+    return spawnVelocity;
+}
+
+// --- the live preview ------------------------------------------------------
+
+function createSpawnPreview() {
+    spawnGroup = new THREE.Group();
+    spawnGroup.name = 'spawnPreview';
+    spawnGroup.visible = false;
+
+    // A wireframe sphere at the computed point, sized like the body that would
+    // actually be created. depthTest off so it is never buried inside a body.
+    spawnGhostGeometry = new THREE.SphereGeometry(1, 20, 14);
+    spawnGhostMaterial = new THREE.MeshBasicMaterial({
+        color: SPAWN_ACCENT,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.9,
+        depthTest: false,
+        depthWrite: false,
+        fog: false,
+        toneMapped: false
+    });
+    spawnGhost = new THREE.Mesh(spawnGhostGeometry, spawnGhostMaterial);
+    spawnGhost.frustumCulled = false;
+    spawnGhost.renderOrder = 4;
+    spawnGhost.raycast = function () { };
+    spawnGroup.add(spawnGhost);
+
+    // The orbit the body would be launched on, drawn in the disk plane.
+    spawnRingGeometry = createCircleGeometry(160);
+    spawnRingMaterial = new THREE.LineBasicMaterial({
+        color: SPAWN_ACCENT, transparent: true, opacity: 0.45, depthWrite: false, fog: false
+    });
+    spawnRing = new THREE.LineLoop(spawnRingGeometry, spawnRingMaterial);
+    spawnRing.frustumCulled = false;
+    spawnRing.raycast = function () { };
+    spawnGroup.add(spawnRing);
+
+    // Two segments: origin -> the point's projection on the disk plane (how far
+    // out it is), then projection -> the point itself (how far OFF the plane it
+    // is). The second one is what makes the depth legible on a camera-plane
+    // placement; on the disk plane it collapses to nothing, which is the honest
+    // drawing of "this body is in the plane".
+    spawnLinePositions = new Float32Array(12);
+    spawnLineGeometry = new THREE.BufferGeometry();
+    spawnLineGeometry.setAttribute('position',
+        new THREE.BufferAttribute(spawnLinePositions, 3).setUsage(THREE.DynamicDrawUsage));
+    spawnLineMaterial = new THREE.LineBasicMaterial({
+        color: SPAWN_ACCENT, transparent: true, opacity: 0.7, depthWrite: false, fog: false
+    });
+    spawnLine = new THREE.LineSegments(spawnLineGeometry, spawnLineMaterial);
+    spawnLine.frustumCulled = false;
+    spawnLine.raycast = function () { };
+    spawnGroup.add(spawnLine);
+
+    return spawnGroup;
+}
+
+function disposeSpawnPreview() {
+    if (spawnGhostGeometry) { spawnGhostGeometry.dispose(); spawnGhostGeometry = null; }
+    if (spawnGhostMaterial) { spawnGhostMaterial.dispose(); spawnGhostMaterial = null; }
+    if (spawnRingGeometry) { spawnRingGeometry.dispose(); spawnRingGeometry = null; }
+    if (spawnRingMaterial) { spawnRingMaterial.dispose(); spawnRingMaterial = null; }
+    if (spawnLineGeometry) { spawnLineGeometry.dispose(); spawnLineGeometry = null; }
+    if (spawnLineMaterial) { spawnLineMaterial.dispose(); spawnLineMaterial = null; }
+    if (spawnGroup && spawnGroup.parent) {
+        spawnGroup.parent.remove(spawnGroup);
+    }
+    spawnGroup = null;
+    spawnGhost = null;
+    spawnRing = null;
+    spawnLine = null;
+    spawnLinePositions = null;
+    spawnPointerInside = false;
+    spawnPointerDown = null;
+}
+
+/**
+ * Ghost radius in AU: the display radius of the body that would be created,
+ * with a SCREEN-SPACE floor.
+ *
+ * displayRadius() bottoms out at 0.02 AU, which is a legible marble in a 20 AU
+ * disk and an invisible speck in a 4000 AU cluster. A marker the user cannot
+ * see is not a preview, so the ghost also never falls below ~1% of its own
+ * distance from the camera - roughly a constant angular size on screen.
+ */
+function spawnGhostRadius() {
+    let physical = 0;
+    if (ui && typeof ui.spawnDerived === 'function') {
+        try {
+            const derived = ui.spawnDerived(spawnPoint.ok ? spawnPoint.radius : 1);
+            if (derived && typeof derived.radius === 'number') {
+                physical = derived.radius;
+            }
+        } catch (e) { /* fall through to the floor below */ }
+    }
+    let radius = displayRadius(physical);
+    if (camera && spawnPoint.ok) {
+        const dx = spawnPoint.x - camera.position.x;
+        const dy = spawnPoint.y - camera.position.y;
+        const dz = spawnPoint.z - camera.position.z;
+        const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const floor = distance * 0.012;
+        if (isFinite(floor) && floor > radius) {
+            radius = floor;
+        }
+    }
+    return radius;
+}
+
+/** Move the preview onto the resolved point. Allocates nothing. */
+function updateSpawnPreviewObjects() {
+    if (!spawnGroup) {
+        return;
+    }
+    if (!spawnPoint.ok) {
+        spawnGroup.visible = false;
+        return;
+    }
+    spawnGroup.visible = true;
+
+    const warn = (spawnPoint.plane !== 'disk');
+    const color = warn ? SPAWN_WARN : SPAWN_ACCENT;
+    if (spawnGhostMaterial.color.getHex() !== color) {
+        spawnGhostMaterial.color.setHex(color);
+        spawnRingMaterial.color.setHex(color);
+        spawnLineMaterial.color.setHex(color);
+    }
+
+    spawnGhost.position.set(spawnPoint.x, spawnPoint.y, spawnPoint.z);
+    spawnGhost.scale.setScalar(spawnGhostRadius());
+
+    // projection of the point onto the disk plane through the origin
+    const along = spawnPoint.x * spawnPlaneNormal.x +
+        spawnPoint.y * spawnPlaneNormal.y +
+        spawnPoint.z * spawnPlaneNormal.z;
+    _spawnProjected.set(
+        spawnPoint.x - spawnPlaneNormal.x * along,
+        spawnPoint.y - spawnPlaneNormal.y * along,
+        spawnPoint.z - spawnPlaneNormal.z * along
+    );
+
+    spawnLinePositions[0] = 0;
+    spawnLinePositions[1] = 0;
+    spawnLinePositions[2] = 0;
+    spawnLinePositions[3] = _spawnProjected.x;
+    spawnLinePositions[4] = _spawnProjected.y;
+    spawnLinePositions[5] = _spawnProjected.z;
+    spawnLinePositions[6] = _spawnProjected.x;
+    spawnLinePositions[7] = _spawnProjected.y;
+    spawnLinePositions[8] = _spawnProjected.z;
+    spawnLinePositions[9] = spawnPoint.x;
+    spawnLinePositions[10] = spawnPoint.y;
+    spawnLinePositions[11] = spawnPoint.z;
+    spawnLineGeometry.attributes.position.needsUpdate = true;
+
+    const ringRadius = _spawnProjected.length();
+    spawnRing.visible = ringRadius > 0;
+    if (spawnRing.visible) {
+        spawnRing.scale.setScalar(ringRadius);
+        // the circle geometry lives in XY: turn its +Z onto the disk normal
+        spawnRing.quaternion.setFromUnitVectors(SPAWN_RING_AXIS, spawnPlaneNormal);
+    }
+}
+
+/** Hand the panel everything it needs to describe the pending placement. */
+function pushSpawnContext() {
+    if (!ui || typeof ui.setSpawnContext !== 'function') {
+        return;
+    }
+    const star = dominantStar();
+    let mass = 0;
+    let mode = 'circular';
+    if (typeof ui.spawnConfig === 'function') {
+        const config = ui.spawnConfig();
+        if (config) {
+            mass = config.mass;
+            mode = config.velocity;
+        }
+    }
+    resolveSpawnVelocity(mode, mass);
+    ui.setSpawnContext({
+        armed: spawnArmed,
+        ok: spawnPoint.ok,
+        hovering: spawnPointerInside,
+        plane: spawnPoint.plane,
+        grazing: spawnPoint.grazing,
+        clamped: spawnPoint.clamped,
+        radius: spawnPoint.radius,
+        focusRadius: spawnVelocity.focusRadius,
+        speed: spawnVelocity.speed,
+        centralMass: spawnVelocity.centralMass,
+        hasFocus: spawnVelocity.hasFocus,
+        starTemperature: (star && typeof star.effectiveTemperature === 'number') ? star.effectiveTemperature : 0,
+        starRadius: (star && typeof star.radius === 'number') ? star.radius : 0
+    });
+}
+
+/** Per-frame upkeep. Never throws: it runs from inside the animation frame. */
+function updateSpawnTool(frameTime) {
+    if (!spawnGroup) {
+        return;
+    }
+    try {
+        if (!spawnArmed || !spawnAimPoint()) {
+            if (spawnGroup.visible) {
+                spawnGroup.visible = false;
+            }
+            return;
+        }
+        // The camera keeps moving, so the world point under a stationary cursor
+        // keeps changing: resolve every frame rather than only on pointermove.
+        resolveSpawnPoint(spawnPointerX, spawnPointerY);
+        updateSpawnPreviewObjects();
+
+        spawnProgradeTimer -= frameTime;
+        if (spawnProgradeTimer <= 0) {
+            measureSpawnProgradeSign();
+        }
+        spawnContextTimer += frameTime;
+        if (spawnContextTimer >= SPAWN_CONTEXT_INTERVAL) {
+            spawnContextTimer = 0;
+            pushSpawnContext();
+        }
+    } catch (error) {
+        // A broken preview must never take the simulation with it.
+        if (spawnGroup) {
+            spawnGroup.visible = false;
+        }
+        setSpawnArmed(false, true);
+        if (ui) {
+            ui.notify('A ferramenta de adicionar corpo foi desarmada por um erro.');
+        }
+        if (typeof console !== 'undefined' && console.error) {
+            console.error(error);
+        }
+    }
+}
+
+// --- arming ----------------------------------------------------------------
+
+/**
+ * Stand-in for CameraController.pickAtClientPoint while the tool is armed.
+ *
+ * setEnabled(false) would also switch OrbitControls off and kill drag-to-rotate,
+ * which is exactly the gesture the user needs while aiming. Overriding the two
+ * picking entry points on the INSTANCE leaves every other behaviour of the
+ * controller - dragging, the wheel, the keyboard, pointer lock - untouched, and
+ * `delete` puts the prototype methods back when the tool is disarmed.
+ */
+function spawnPickSuppressed() {
+    return null;
+}
+
+function applySpawnPickGuard() {
+    if (!cameraController) {
+        return;
+    }
+    if (spawnArmed) {
+        cameraController.pickAtClientPoint = spawnPickSuppressed;
+        cameraController.pickAtScreenCenter = spawnPickSuppressed;
+        return;
+    }
+    if (Object.prototype.hasOwnProperty.call(cameraController, 'pickAtClientPoint')) {
+        delete cameraController.pickAtClientPoint;
+    }
+    if (Object.prototype.hasOwnProperty.call(cameraController, 'pickAtScreenCenter')) {
+        delete cameraController.pickAtScreenCenter;
+    }
+}
+
+function setSpawnArmed(value, silent) {
+    const wanted = !!value && running && !!spawnGroup;
+    if (wanted === spawnArmed) {
+        if (ui && typeof ui.setSpawnArmed === 'function') {
+            ui.setSpawnArmed(spawnArmed);
+        }
+        return spawnArmed;
+    }
+    spawnArmed = wanted;
+    applySpawnPickGuard();
+
+    if (document && document.body) {
+        document.body.classList.toggle('nv-armed', spawnArmed);
+    }
+    if (spawnGroup) {
+        spawnGroup.visible = false;
+    }
+    spawnPointerDown = null;
+    spawnContextTimer = SPAWN_CONTEXT_INTERVAL;
+
+    if (spawnArmed) {
+        spawnProgradeTimer = 0;
+        measureSpawnProgradeSign();
+    }
+    if (ui && typeof ui.setSpawnArmed === 'function') {
+        ui.setSpawnArmed(spawnArmed);
+    }
+    if (ui && !silent) {
+        ui.notify(spawnArmed
+            ? 'Ferramenta armada: clique na cena para posicionar o corpo.'
+            : 'Ferramenta de adicionar corpo desarmada.');
+    }
+    return spawnArmed;
+}
+
+function toggleSpawnArmed() {
+    setSpawnArmed(!spawnArmed);
+}
+
+// --- placing and undoing ---------------------------------------------------
+
+/** Build the body the panel describes and hand it to the simulation. */
+function placeSpawnedBody() {
+    if (!running || !simulation || !ui || !spawnPoint.ok) {
+        return null;
+    }
+    if (typeof ui.spawnConfig !== 'function' || typeof simulation.addPlanet !== 'function') {
+        return null;
+    }
+    const config = ui.spawnConfig();
+    if (!config || !(config.mass > 0)) {
+        ui.notify('Informe uma massa maior que zero.');
+        return null;
+    }
+
+    let composition = null;
+    if (typeof ui.buildSpawnComposition === 'function') {
+        composition = ui.buildSpawnComposition(spawnPoint.radius);
+    }
+    resolveSpawnVelocity(config.velocity, config.mass);
+
+    let planet;
+    try {
+        planet = new Planet(
+            new Vector(spawnPoint.x, spawnPoint.y, spawnPoint.z),
+            new Vector(spawnVelocity.x, spawnVelocity.y, spawnVelocity.z),
+            config.mass,
+            composition
+        );
+    } catch (error) {
+        ui.notify('Não foi possível criar o corpo.');
+        if (typeof console !== 'undefined' && console.error) {
+            console.error(error);
+        }
+        return null;
+    }
+
+    // addPlanet() joins a star to the direct-sum set, but only when the body
+    // already knows it is one. classify() has run in the constructor, so the
+    // flag is simply mirrored here rather than guessed.
+    if (planet.classification === 'star') {
+        planet.isStar = true;
+    }
+    simulation.addPlanet(planet);
+    spawnUndoStack.push(planet);
+    if (spawnUndoStack.length > SPAWN_UNDO_LIMIT) {
+        spawnUndoStack.shift();
+    }
+
+    // Make it visible THIS frame, not next: capacity first (the mesh may be
+    // full), then the star layer (it may be a star), then the instances.
+    ensureBodyCapacity(simulation.planets.length);
+    orbitTargetsDirty = true;
+    syncStars();
+    updateStarField();
+    syncInstances();
+
+    if (cameraController && typeof cameraController.select === 'function') {
+        cameraController.select(planet);
+    }
+    ui.setSpawnUndoCount(spawnUndoStack.length);
+    ui.refresh(true);
+
+    const label = (typeof planet.classLabel === 'string' && planet.classLabel)
+        ? planet.classLabel : 'Corpo';
+    ui.notify(label + ' #' + planet.id + ' criado a ' +
+        NavigatorUI.formatAu(spawnPoint.radius) + ' do centro' +
+        (spawnPoint.plane === 'disk' ? '' : ' (plano da câmera)'));
+    return planet;
+}
+
+/** Remove the most recent body this tool created. */
+function undoLastSpawn() {
+    if (!simulation || typeof simulation.removePlanet !== 'function') {
+        return null;
+    }
+    while (spawnUndoStack.length > 0) {
+        const planet = spawnUndoStack.pop();
+        if (!planet || planet.removed) {
+            continue;               // already accreted by something else
+        }
+        simulation.removePlanet(planet);
+        orbitTargetsDirty = true;
+        syncStars();
+        updateStarField();
+        syncInstances();
+        if (ui) {
+            ui.setSpawnUndoCount(spawnUndoStack.length);
+            ui.refresh(true);
+            const label = (typeof planet.classLabel === 'string' && planet.classLabel)
+                ? planet.classLabel : 'Corpo';
+            ui.notify(label + ' #' + planet.id + ' removido.');
+        }
+        return planet;
+    }
+    if (ui) {
+        ui.setSpawnUndoCount(0);
+        ui.notify('Nada para desfazer.');
+    }
+    return null;
+}
+
+// --- pointer input ---------------------------------------------------------
+//
+// These live on the canvas alongside CameraController's own handlers and never
+// cancel them: OrbitControls keeps its pointerdown / pointermove / pointerup and
+// drag-to-rotate works exactly as before. A click is told apart from a drag with
+// the same thresholds the controller uses, so the two can never both act on one
+// gesture.
+
+/**
+ * The viewport pixel the tool is aiming at.
+ *
+ * In fly mode the pointer is LOCKED - clientX/clientY stop moving - and the
+ * user aims with the crosshair NavigatorUI draws at the centre of the screen.
+ * So in that mode the centre is the aim point, which also matches what the
+ * camera controller's own pickAtScreenCenter() does.
+ *
+ * @returns {boolean} true when there is something to aim at
+ */
+function spawnAimPoint() {
+    if (cameraController && cameraController.mode === CameraController.FLY) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        if (!rect.width || !rect.height) {
+            return false;
+        }
+        spawnPointerX = rect.left + rect.width / 2;
+        spawnPointerY = rect.top + rect.height / 2;
+        spawnPointerInside = true;
+        return true;
+    }
+    return spawnPointerInside;
+}
+
+function spawnTrackPointer(event) {
+    spawnPointerX = event.clientX;
+    spawnPointerY = event.clientY;
+    spawnPointerInside = true;
+}
+
+function onSpawnPointerDown(event) {
+    if (!spawnArmed || event.isPrimary === false) {
+        return;
+    }
+    spawnTrackPointer(event);
+    if (event.button !== 0) {
+        spawnPointerDown = null;
+        return;
+    }
+    spawnPointerDown = { x: event.clientX, y: event.clientY, time: Date.now() };
+}
+
+function onSpawnPointerMove(event) {
+    if (!spawnArmed) {
+        return;
+    }
+    spawnTrackPointer(event);
+}
+
+function onSpawnPointerUp(event) {
+    if (!spawnArmed || event.isPrimary === false) {
+        return;
+    }
+    const down = spawnPointerDown;
+    spawnPointerDown = null;
+    if (!down || event.button !== 0) {
+        return;
+    }
+    const moved = Math.abs(event.clientX - down.x) + Math.abs(event.clientY - down.y);
+    const elapsed = Date.now() - down.time;
+    if (moved > SPAWN_CLICK_MOVE || elapsed > SPAWN_CLICK_TIME) {
+        return;                     // that was a drag-rotate, not a placement
+    }
+    spawnTrackPointer(event);
+    spawnAimPoint();
+    if (!resolveSpawnPoint(spawnPointerX, spawnPointerY)) {
+        if (ui) {
+            ui.notify('Não foi possível resolver um ponto sob o cursor.');
+        }
+        return;
+    }
+    placeSpawnedBody();
+    updateSpawnPreviewObjects();
+    pushSpawnContext();
+}
+
+function onSpawnPointerLeave() {
+    spawnPointerInside = false;
+    spawnPointerDown = null;
+    if (spawnGroup) {
+        spawnGroup.visible = false;
+    }
+}
+
+/** Wire the tool to the canvas. Called once, from initStage(). */
+function attachSpawnListeners(element) {
+    element.addEventListener('pointerdown', onSpawnPointerDown, false);
+    element.addEventListener('pointermove', onSpawnPointerMove, false);
+    element.addEventListener('pointerup', onSpawnPointerUp, false);
+    element.addEventListener('pointerleave', onSpawnPointerLeave, false);
+    element.addEventListener('pointercancel', onSpawnPointerLeave, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -2090,17 +3225,33 @@ function onWindowResize() {
 /** Extra shortcuts owned by main.js, appended to the controller's own table. */
 const EXTRA_KEY_BINDINGS = [
     { group: 'Simulação', keys: 'O', description: 'Mostrar ou ocultar as guias do disco' },
-    { group: 'Simulação', keys: 'T', description: 'Alternar órbitas: nenhuma / elipses / rastros / ambos' }
+    { group: 'Simulação', keys: 'T', description: 'Alternar órbitas: nenhuma / elipses / rastros / ambos' },
+    { group: 'Simulação', keys: 'P', description: 'Armar ou desarmar a ferramenta de adicionar corpo' },
+    { group: 'Simulação', keys: 'Ctrl+Z', description: 'Desfazer o último corpo adicionado' }
 ];
 
 function onExtraKeyDown(event) {
-    if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) {
+    if (event.defaultPrevented || event.metaKey || event.altKey) {
         return;
     }
     if (!running || (picker && picker.isVisible())) {
         return;                     // the launch screen owns the keyboard
     }
     if (CameraController.isTypingTarget(event.target)) {
+        return;
+    }
+    // Ctrl+Z is the one shortcut here that WANTS the modifier; the camera
+    // controller ignores any key pressed with Ctrl, so there is no contention.
+    if (event.ctrlKey) {
+        if (event.code === 'KeyZ' || (event.key || '').toLowerCase() === 'z') {
+            event.preventDefault();
+            undoLastSpawn();
+        }
+        return;
+    }
+    if (event.code === 'KeyP' || (event.key || '').toLowerCase() === 'p') {
+        event.preventDefault();
+        toggleSpawnArmed();
         return;
     }
     // CameraController keys off event.code, so match it for consistency, but
@@ -2180,6 +3331,10 @@ function initStage() {
 
     document.body.appendChild(renderer.domElement);
 
+    // The click-to-place tool listens alongside CameraController rather than
+    // instead of it, so drag-to-rotate keeps working while it is armed.
+    attachSpawnListeners(renderer.domElement);
+
     window.addEventListener('resize', onWindowResize, false);
     window.addEventListener('keydown', onExtraKeyDown, false);
 
@@ -2207,6 +3362,13 @@ function initStage() {
  */
 function teardownRun() {
     running = false;
+
+    // Disarm BEFORE the controller is disposed: disarming restores the picking
+    // methods the tool overrode on it, and a scenario change must never leave a
+    // half-armed tool pointing at a dead run.
+    setSpawnArmed(false, true);
+    spawnUndoStack.length = 0;
+    bodyMeshCapped = false;
 
     if (detailBodies) {
         try { detailBodies.dispose(); } catch (e) { /* going away anyway */ }
@@ -2242,6 +3404,7 @@ function teardownRun() {
     onSpawnedHandler = null;
     simulation = null;
 
+    disposeSpawnPreview();
     disposeOrbitLayer();
     disposeGuides();
     disposeStarLayer();
@@ -2344,6 +3507,14 @@ function buildRun(id, params) {
 
     world.add(createOrbitLayer(sceneRadius));
 
+    // The plane a click resolves against. meta.diskNormal first, exactly as the
+    // guides do; the sense (which way the disk turns) is measured separately,
+    // because a declared normal carries no guarantee about its sign.
+    resolveSpawnPlaneNormal(normal);
+    spawnProgradeSign = 1;
+    spawnProgradeTimer = 0;
+    world.add(createSpawnPreview());
+
     syncStars();
     updateStarField();
     updateDetailBodies();
@@ -2403,7 +3574,10 @@ function buildRun(id, params) {
         onToggleGuides: () => toggleGuides(),
         onOrbitModeChange: (mode) => setOrbitMode(mode),
         onOrbitScopeChange: (scope) => setOrbitScope(scope),
-        onChangeScenario: () => openPicker()
+        onChangeScenario: () => openPicker(),
+        onSpawnArm: (armed) => setSpawnArmed(armed),
+        onSpawnConfigChange: () => { spawnContextTimer = SPAWN_CONTEXT_INTERVAL; },
+        onSpawnUndo: () => undoLastSpawn()
     });
     ui.setGuidesVisible(guidesVisible);
     ui.setOrbitMode(orbitMode);
@@ -2411,6 +3585,10 @@ function buildRun(id, params) {
     ui.setSpeed(1, false);
     ui.setPaused(false);
     ui.setScenario(activeLabel, activeScenarioId);
+    ui.setSpawnArmed(false);
+    ui.setSpawnUndoCount(0);
+    measureSpawnProgradeSign();
+    pushSpawnContext();
 
     onRemovedHandler = function (planet) {
         if (!cameraController || !ui) {
@@ -2516,6 +3694,7 @@ let pausedBeforePicker = false;
 /** "Trocar cenário": back to the launch screen without reloading the page. */
 function openPicker() {
     const screen = ensurePicker();
+    setSpawnArmed(false, true);
     pausedBeforePicker = paused;
     paused = true;
     if (ui) {
@@ -2645,6 +3824,7 @@ function boot() {
         syncInstances();
         updateOrbits(frameTime, simulatedTime());
         cameraController.update(frameTime);
+        updateSpawnTool(frameTime);
         ui.update(frameTime);
         updateSnowLine(ui.snowLineRadius());
     }

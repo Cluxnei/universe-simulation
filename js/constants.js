@@ -128,6 +128,66 @@ const GAS_DISK_MINIMUM_RESERVOIR = 1e-8                     // Msun, below this 
 const FUSION_ENABLED = true
 const FUSION_TIME_SCALE = 1e-4
 
+// --- Black holes --------------------------------------------------------------
+//
+// A black hole is dynamically JUST A POINT MASS. Newtonian gravity cannot tell a
+// 10 Msun black hole from a 10 Msun star, so nothing below touches the force
+// law, the integrator or the tree: every knob here is about capture and about
+// the light the infalling matter emits on its way in.
+//
+// The scales involved, measured rather than asserted:
+//
+//     r_s(1 Msun)     = 1.974e-8 AU   235000x SMALLER than the Sun
+//     r_s(1e6 Msun)   = 1.974e-2 AU   20x the softening length, resolvable
+//     R_tidal(10 Msun, Sun-like) = 0.0100 AU
+//     R_tidal(1e6 Msun, Sun-like) = 0.465 AU
+//
+// So for a stellar-mass hole the horizon sits five orders of magnitude below
+// SOFTENING and is not a thing this simulation can resolve; the TIDAL radius is
+// macroscopic and is what actually eats stars. Capture is keyed off that.
+
+// The capture radius can never fall below the length at which the softened
+// force stops being the real force. Two bodies closer than SOFTENING are not
+// being integrated correctly any more - the potential has been deliberately
+// flattened there - so merging them is the honest response, and it is also what
+// lets two stellar-mass black holes ever merge at all: their horizons are 2e-7
+// AU apart and no timestep would ever resolve a contact that small.
+const BLACK_HOLE_MIN_CAPTURE_RADIUS = SOFTENING
+
+// Broad-phase safety margin ONLY. The collision grid is sized from each body's
+// stored accretionRadius, which for a hole is its tidal radius against a
+// Sun-like (solar mean density) victim; the exact pairwise tidal radius used to
+// decide a capture depends on the victim's mean density, which for a puffy
+// massive star can be ~1/8 solar. Doubling the stored value keeps such a pair in
+// the same grid neighbourhood. It does NOT widen the capture test itself.
+const BLACK_HOLE_CAPTURE_MARGIN = 2.0
+
+// Accretion luminosity. A thin disk around a non-rotating hole radiates ~6% of
+// the rest mass of what it swallows, ~10-40% for a spinning one; 0.1 is the
+// figure usually quoted and is 15x more efficient than hydrogen fusion (0.7%).
+const BLACK_HOLE_ACCRETION_ENABLED = true
+const BLACK_HOLE_ACCRETION_EFFICIENCY = 0.1
+// Captured mass does not radiate instantly: it circularises and drains inward
+// on the disk's viscous timescale, which is what turns a single tidal disruption
+// into a flare that fades over months to years rather than a one-frame spike.
+// Scaled to this simulation's compressed clock, like GAS_ACCRETION_TIMESCALE.
+// A swallowed star is a lot of fuel: 20 Msun of it drains with this e-folding
+// but stays pinned at the Eddington cap below for the first ~80 years and then
+// fades over the next ~100, which is the light curve a run actually shows.
+const BLACK_HOLE_ACCRETION_TIMESCALE = 5.0                  // years, e-folding
+// Below this the disk has gone out and the hole is dark again.
+const BLACK_HOLE_MIN_ACCRETION_RESERVOIR = 1e-12            // Msun
+// Radiation pressure caps the sustained output at the Eddington limit
+// (32840 Lsun per Msun). Real tidal disruptions do exceed it briefly; capping
+// keeps the HUD readable and the renderer's dynamic range finite.
+const BLACK_HOLE_EDDINGTON_LIMITED = true
+
+// The hole itself, drawn. Not quite #000000: pure black is indistinguishable
+// from the background and the body would simply vanish. This is the colour of
+// the horizon, not of the disk - the disk's light is reported through the normal
+// `luminosity` field.
+const BLACK_HOLE_COLOR_HEX = '#06060a'
+
 // --- Barnes-Hut ---------------------------------------------------------------
 // The star is summed directly rather than through the tree: it holds ~99.9% of
 // the mass, and approximating it would wreck every orbit in the disk.
@@ -151,6 +211,16 @@ const RENDER_RADIUS_SCALE = 6
 const RENDER_RADIUS_EXPONENT = 0.55
 const RENDER_RADIUS_MIN = 0.03              // AU, floor so nothing vanishes
 const RENDER_RADIUS_MAX = 1.5               // AU, ceiling so the star fits on screen
+
+// Black holes need their own display curve. A Schwarzschild radius spans eight
+// decades of mass (2e-8 AU at 1 Msun to 8e-2 AU at Sgr A*), and the ordinary
+// RENDER_RADIUS_* curve pins everything below ~3300 Msun to its floor, drawing a
+// stellar-mass hole the same size as a pebble. This keeps the mass ordering
+// visible across the whole range instead.
+const RENDER_BLACK_HOLE_RADIUS_SCALE = 0.045      // AU at 10 Msun
+const RENDER_BLACK_HOLE_RADIUS_EXPONENT = 0.2
+const RENDER_BLACK_HOLE_RADIUS_MIN = 0.045
+const RENDER_BLACK_HOLE_RADIUS_MAX = 1.5
 
 // Blackbody colour is used for anything that emits its own light; everything
 // else is shaded by composition.
