@@ -215,8 +215,8 @@ canvas {
     width: 346px;
     display: flex;
     flex-direction: column;
-    min-height: 150px;
-    max-height: calc(100vh - 352px);
+    min-height: 130px;
+    max-height: calc(100vh - 468px);
 }
 
 .nv-bodies.nv-panel--collapsed {
@@ -383,13 +383,27 @@ canvas {
 .nv-row__label {
     grid-column: 2;
     grid-row: 1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
     color: var(--nv-text);
 }
 
-.nv-row__distance {
+.nv-row__name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--nv-dim);
+    font-size: 11px;
+}
+
+.nv-row--selected .nv-row__name {
+    color: var(--nv-text);
+}
+
+.nv-row__value {
     grid-column: 3;
     grid-row: 1;
     font-variant-numeric: tabular-nums;
@@ -730,6 +744,274 @@ canvas {
 }
 
 /* ==========================================================================
+   physical classes and composition
+   --------------------------------------------------------------------------
+   One colour per class of body (asteroid -> star) and one per material group
+   (gas / ice / rock / metal). The material colours deliberately echo the four
+   end members that composition.js blends for the 3D view, so a body reads the
+   same in the panel as it does in the scene.
+   ========================================================================== */
+
+:root {
+    --nv-class-asteroid: #9c9184;
+    --nv-class-planet: #79cba8;
+    --nv-class-gasGiant: #e3b07a;
+    --nv-class-brownDwarf: #c8705a;
+    --nv-class-star: #ffd166;
+
+    --nv-mat-gas: #d8c9a0;
+    --nv-mat-ice: #cfe6f2;
+    --nv-mat-rock: #8a7a68;
+    --nv-mat-metal: #6d7076;
+}
+
+/* a row or field the physics layer did not publish */
+.nv-hidden {
+    display: none !important;
+}
+
+/* --- class badge -------------------------------------------------------- */
+
+.nv-badge {
+    flex: 0 0 auto;
+    padding: 1px 7px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    background: rgba(255, 255, 255, 0.05);
+    white-space: nowrap;
+    color: var(--nv-class-asteroid);
+}
+
+.nv-badge--sm {
+    padding: 0 6px;
+    font-size: 9px;
+    letter-spacing: 0.02em;
+}
+
+.nv-badge[data-class="asteroid"] { color: var(--nv-class-asteroid); }
+.nv-badge[data-class="planet"] { color: var(--nv-class-planet); }
+.nv-badge[data-class="gasGiant"] { color: var(--nv-class-gasGiant); }
+.nv-badge[data-class="brownDwarf"] { color: var(--nv-class-brownDwarf); }
+.nv-badge[data-class="star"] { color: var(--nv-class-star); }
+
+/* --- HUD class tally ---------------------------------------------------- */
+
+.nv-classes {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 8px 0;
+    padding: 7px 0;
+    border-top: 1px solid var(--nv-border);
+    border-bottom: 1px solid var(--nv-border);
+}
+
+.nv-classchip {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 11px;
+    color: var(--nv-text);
+}
+
+.nv-classchip--zero {
+    opacity: 0.38;
+}
+
+.nv-classchip__dot {
+    flex: 0 0 auto;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--nv-class-asteroid);
+    box-shadow: 0 0 6px currentColor;
+}
+
+.nv-classchip[data-class="asteroid"] .nv-classchip__dot { background: var(--nv-class-asteroid); }
+.nv-classchip[data-class="planet"] .nv-classchip__dot { background: var(--nv-class-planet); }
+.nv-classchip[data-class="gasGiant"] .nv-classchip__dot { background: var(--nv-class-gasGiant); }
+.nv-classchip[data-class="brownDwarf"] .nv-classchip__dot { background: var(--nv-class-brownDwarf); }
+.nv-classchip[data-class="star"] .nv-classchip__dot { background: var(--nv-class-star); }
+
+.nv-classchip__name {
+    flex: 1 1 auto;
+    color: var(--nv-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nv-classchip__count {
+    flex: 0 0 auto;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+}
+
+/* --- inspector heading -------------------------------------------------- */
+
+.nv-inspector__heading {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.nv-inspector__heading .nv-inspector__name {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+/* --- composition breakdown ---------------------------------------------- */
+
+.nv-composition {
+    margin-top: 10px;
+    padding-top: 9px;
+    border-top: 1px solid var(--nv-border);
+}
+
+.nv-composition__title {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--nv-gold);
+    margin-bottom: 6px;
+}
+
+/* the headline element: four material fractions as one stacked bar */
+.nv-compbar {
+    display: flex;
+    width: 100%;
+    height: 12px;
+    margin-bottom: 7px;
+    border-radius: 999px;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--nv-border);
+    box-shadow: inset 0 0 8px rgba(0, 0, 0, 0.45);
+}
+
+.nv-compbar__seg {
+    display: block;
+    height: 100%;
+    min-width: 0;
+    transition: width 0.25s ease;
+    background: var(--nv-mat-rock);
+}
+
+.nv-compbar__seg[data-part="gas"] { background: var(--nv-mat-gas); }
+.nv-compbar__seg[data-part="ice"] { background: var(--nv-mat-ice); }
+.nv-compbar__seg[data-part="rock"] { background: var(--nv-mat-rock); }
+.nv-compbar__seg[data-part="metal"] { background: var(--nv-mat-metal); }
+
+.nv-compbar__legend {
+    grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
+    column-gap: 8px;
+}
+
+.nv-compbar__legend dt {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.nv-compbar__dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 2px;
+    background: var(--nv-mat-rock);
+}
+
+.nv-compbar__dot[data-part="gas"] { background: var(--nv-mat-gas); }
+.nv-compbar__dot[data-part="ice"] { background: var(--nv-mat-ice); }
+.nv-compbar__dot[data-part="rock"] { background: var(--nv-mat-rock); }
+.nv-compbar__dot[data-part="metal"] { background: var(--nv-mat-metal); }
+
+.nv-composition__summary {
+    margin-top: 7px;
+    font-size: 10px;
+    line-height: 1.5;
+    color: var(--nv-faint);
+}
+
+/* --- orbit controls (HUD panel) ------------------------------------------ */
+
+.nv-orbits {
+    margin-top: 9px;
+    padding-top: 8px;
+    border-top: 1px solid var(--nv-border);
+}
+
+.nv-orbits__title {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--nv-gold);
+    margin-bottom: 6px;
+}
+
+.nv-chiprow {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 4px;
+}
+
+.nv-chip--mini {
+    padding: 2px 7px;
+    font-size: 10px;
+    letter-spacing: 0.01em;
+}
+
+/* the scope row is meaningless while orbits are off */
+.nv-orbits--off .nv-chiprow + .nv-chiprow {
+    opacity: 0.4;
+}
+
+.nv-orbits__hint {
+    margin-top: 4px;
+    font-size: 10px;
+    line-height: 1.45;
+    color: var(--nv-faint);
+}
+
+/* --- playback extras ---------------------------------------------------- */
+
+.nv-extras {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    position: relative;
+    padding-left: 10px;
+}
+
+.nv-extras::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 10%;
+    height: 80%;
+    border-left: 1px solid var(--nv-border);
+}
+
+/* --- the panels grew: let them scroll instead of running off screen ----- */
+
+.nv-hud .nv-panel__body {
+    max-height: calc(100vh - 120px);
+    overflow-y: auto;
+}
+
+.nv-inspector .nv-panel__body {
+    max-height: calc(100vh - 200px);
+    overflow-y: auto;
+}
+
+/* ==========================================================================
    compact viewports
    ========================================================================== */
 
@@ -740,7 +1022,7 @@ canvas {
 
     .nv-bodies {
         width: 300px;
-        max-height: calc(100vh - 300px);
+        max-height: calc(100vh - 420px);
     }
 
     .nv-inspector {
