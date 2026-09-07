@@ -1,26 +1,41 @@
 /**
- * The simulation: a central star plus a protoplanetary disk of embryos, in
+ * The simulation: a set of bodies handed to it by a scenario, integrated in
  * solar masses, astronomical units and years (G = 4*PI^2).
  *
+ * IT NO LONGER BUILDS ITS OWN UNIVERSE. scenarios.js decides what exists, where
+ * it is and what it is made of; this class only integrates it. That inversion
+ * is what makes several stars, a cluster or a collision possible at all - the
+ * old constructor could only ever produce one star and one disk.
+ *
  * The integrator is Velocity-Verlet with pair-symmetric force accumulation, so
- * total momentum is conserved to round-off. Gravity is Barnes-Hut over the disk
- * bodies, plus the star summed EXACTLY, body by body: the star holds 99.9% of
- * the mass and letting a tree node approximate it would wreck every orbit in
- * the disk. Collisions are swept (continuous), and accretion is momentum- and
- * element-conserving.
+ * total momentum is conserved to round-off. Gravity is Barnes-Hut over the
+ * light bodies, plus EVERY star summed EXACTLY, body by body: the stars hold
+ * almost all of the mass and there are only ever a handful to a few hundred of
+ * them, so approximating them through the tree would wreck every orbit for no
+ * meaningful saving. Collisions are swept (continuous), and accretion is
+ * momentum- and element-conserving.
  */
 
-// --- Local tunables -----------------------------------------------------------
-// Everything in this block belongs in constants.js and should migrate there;
-// this file cannot edit that one.
-
 class Simulation{
-    constructor(planets){
+    /**
+     * `bodies` is a finished array of Planets from a scenario; `meta` is the
+     * scenario's BuildResult meta. Both are optional: with no arguments the
+     * default scenario is built, so a caller that forgets still gets a universe.
+     */
+    constructor(bodies, meta){
+        const built = Simulation.resolveBodies(bodies, meta)
+        this.planets = built.bodies
+        this.meta = built.meta
+        this.scenarioId = built.meta.scenarioId
+        // Every star in the system, direct-summed outside the tree, heaviest
+        // first. `star` is the dominant one and is kept for compatibility: the
+        // HUD, the renderer and the orbital elements all still read it.
+        this.stars = []
         this.star = null
         // Runtime switches for the two non-conservative processes, so the UI
         // and the verification harness can turn them off without editing code.
-        this.gasAccretionEnabled = GAS_ACCRETION_ENABLED
-        this.fusionEnabled = FUSION_ENABLED
+        this.gasAccretionEnabled = GAS_ACCRETION_ENABLED && this.meta.gasAccretion
+        this.fusionEnabled = FUSION_ENABLED && this.meta.fusion
         this.gasReservoir = GAS_DISK_MASS
         this.gasAccreted = 0
         // Gas comes from outside the N-body system. Book what it injects so the
@@ -30,14 +45,19 @@ class Simulation{
         this.gasVelocity = new Vector()
         this.fusionEnergyReleased = 0
         this.nebularComposition = new Composition()
-        this.planets = planets || this.randomPlanets()
-        if(!this.star)
-            this.star = this.findCentralStar()
+        // The timestep the scenario asked for. A tight binary needs a far
+        // smaller one than a 20 AU disk, and using the disk's dt on the binary
+        // makes it visibly wrong within one orbit.
+        this.dt = this.meta.suggestedDt
+        this.refreshStars()
         // Which way the disk turns. Accreted gas has to orbit with it, not
         // against it: gas on a retrograde orbit torques a growing planet's
         // angular momentum away and drops it straight into the star.
         this.diskNormal = new Vector(0, 1, 0)
-        this.measureDiskNormal()
+        if(this.meta.diskNormal)
+            this.diskNormal.set(this.meta.diskNormal.x, this.meta.diskNormal.y, this.meta.diskNormal.z)
+        else
+            this.measureDiskNormal()
         this.removedListeners = []
         this.spawnedListeners = []
         this.octree = new Octree(BARNES_HUT_THETA, SOFTENING)
@@ -51,9 +71,13 @@ class Simulation{
         this.previousAccelerationY = new Float64Array(0)
         this.previousAccelerationZ = new Float64Array(0)
         this.treeAcceleration = new Float64Array(3)
-        // the disk bodies handed to the octree: everything except the star
+        // the light bodies handed to the octree: everything except the stars
         this.treeBodies = []
         this.treeIndex = new Int32Array(0)
+        // ordinal of each body in this.stars, or -1. Rebuilt every acceleration
+        // pass so the direct sum can skip star-star pairs it has already done.
+        this.starOrdinal = new Int32Array(0)
+        this.starSlots = new Int32Array(0)
         // collision broad phase scratch
         this.cellX = new Int32Array(0)
         this.cellY = new Int32Array(0)
@@ -72,137 +96,122 @@ class Simulation{
         this.absorbedByStar = 0
     }
 
-    // ---------------------------------------------------------------- spawning
+    // ---------------------------------------------------------------- scenarios
 
-    /**
-     * A star plus a Keplerian disk.
-     *
-     * The disk lies in the xz-plane, so its angular momentum points along +y,
-     * which is the renderer's up axis: the camera then orbits the disk's pole
-     * rather than tumbling across it. Orbits are built with textbook orbital
-     * elements in the standard z-normal frame and rotated into that plane by
-     * (x, y, z) -> (x, z, -y).
-     */
-    randomPlanets(count = PLANETS_NUMBER){
-        const planets = []
-        if(STAR_ENABLED){
-            // The star gets the nebular mix (X = 0.71, Y = 0.27, Z = 0.02), so
-            // structure.js classifies it as a star and gives it the right
-            // radius, luminosity and colour with nothing hard coded here.
-            const star = new Planet(new Vector(), new Vector(), STAR_MASS, new Composition())
-            star.isCentralStar = true
-            this.star = star
-            planets.push(star)
-        }
-        const centralMass = this.star ? this.star.mass : DISK_TOTAL_MASS
-        // The snow line is not a setting: it follows from the star we just
-        // built, so a hotter star moves it outwards on its own.
-        const starTemperature = this.star ? this.star.effectiveTemperature : SOLAR_EFFECTIVE_TEMPERATURE
-        const starRadius = this.star ? this.star.radius : SOLAR_RADIUS
-        const embryoMass = DISK_TOTAL_MASS / Math.max(1, count)
-        for(let i = 0; i < count; i++){
-            const semiMajorAxis = this.sampleDiskRadius()
-            // Rayleigh distributions with the requested RMS. For a Rayleigh
-            // variate E[x^2] = 2*sigma^2, so sigma = rms/sqrt(2) and the
-            // inverse transform is x = rms * sqrt(-ln u).
-            const eccentricity = DISK_ECCENTRICITY_RMS * Math.sqrt(-Math.log(1 - Math.random()))
-            const inclination = DISK_INCLINATION_RMS * Math.sqrt(-Math.log(1 - Math.random()))
-            const planet = new Planet(
-                new Vector(), new Vector(), embryoMass,
-                Composition.fromFormationRadius(semiMajorAxis, starTemperature, starRadius)
-            )
-            this.placeOnOrbit(planet, semiMajorAxis, Math.min(eccentricity, 0.9), inclination, centralMass)
-            planets.push(planet)
-        }
-        this.conditionInitialState(planets)
-        return planets
+    /** Build a named scenario and wrap it in a Simulation. */
+    static fromScenario(id, params){
+        const result = buildScenario(id, params)
+        return new Simulation(result.bodies, result.meta)
     }
 
     /**
-     * Inverse-transform sample of the surface density profile
-     * Sigma(r) ~ r^-p between the disk edges.
+     * Normalise whatever the caller passed into a (bodies, meta) pair.
      *
-     * The mass in an annulus is Sigma(r) * 2*pi*r*dr ~ r^(1-p) dr, so the
-     * cumulative mass goes as r^(2-p) and the sample is
-     *
-     *     r = [ rin^q + u * (rout^q - rin^q) ]^(1/q),   q = 2 - p
-     *
-     * Sampling r uniformly instead would put far too much mass in the outer
-     * disk, where it would never accrete into anything.
+     * With no bodies we build the default scenario. If scenarios.js is missing
+     * entirely - the script tag was not added - we fall back to a lone star
+     * rather than throwing, and say so loudly: an empty sky is a far more
+     * obvious symptom than a silent exception during page load.
      */
-    sampleDiskRadius(){
-        const inner = DISK_INNER_RADIUS
-        const outer = DISK_OUTER_RADIUS
-        const q = 2 - DISK_SURFACE_DENSITY_EXPONENT
-        const u = Math.random()
-        if(Math.abs(q) < 1e-9){
-            // p = 2 exactly: the cumulative mass is logarithmic.
-            return inner * Math.pow(outer / inner, u)
+    static resolveBodies(bodies, meta){
+        if(Array.isArray(bodies) && bodies.length > 0)
+            return { bodies: bodies, meta: Simulation.normalizeMeta(meta) }
+        if(typeof buildScenario === 'function'){
+            const built = buildScenario(
+                meta && meta.scenarioId ? meta.scenarioId : DEFAULT_SCENARIO_ID, null)
+            return { bodies: built.bodies, meta: Simulation.normalizeMeta(built.meta) }
         }
-        const low = Math.pow(inner, q)
-        const high = Math.pow(outer, q)
-        return Math.pow(low + u * (high - low), 1 / q)
+        if(typeof console !== 'undefined' && console.warn)
+            console.warn('Simulation: scenarios.js is not loaded, falling back to a single star.')
+        const star = new Planet(new Vector(), new Vector(), STAR_MASS, new Composition())
+        star.isStar = true
+        return { bodies: [star], meta: Simulation.normalizeMeta(meta) }
+    }
+
+    /** Every meta field the scenario contract promises, present and finite. */
+    static normalizeMeta(meta){
+        const source = meta || {}
+        return {
+            scenarioId: source.scenarioId || (typeof DEFAULT_SCENARIO_ID === 'string'
+                ? DEFAULT_SCENARIO_ID : 'planetary-system'),
+            label: source.label || 'Sistema',
+            suggestedDt: isFinite(source.suggestedDt) && source.suggestedDt > 0
+                ? source.suggestedDt : FIXED_DT,
+            cameraDistance: isFinite(source.cameraDistance) && source.cameraDistance > 0
+                ? source.cameraDistance : 2 * DISK_OUTER_RADIUS,
+            diskNormal: source.diskNormal || null,
+            gasAccretion: source.gasAccretion !== undefined ? !!source.gasAccretion : true,
+            fusion: source.fusion !== undefined ? !!source.fusion : true,
+            gasInnerRadius: isFinite(source.gasInnerRadius) && source.gasInnerRadius > 0
+                ? source.gasInnerRadius : DISK_INNER_RADIUS,
+            gasOuterRadius: isFinite(source.gasOuterRadius) && source.gasOuterRadius > 0
+                ? source.gasOuterRadius : DISK_OUTER_RADIUS,
+            notes: source.notes || ''
+        }
+    }
+
+    // ---------------------------------------------------------------- stars
+
+    /**
+     * Rebuild the list of bodies that are summed exactly outside the tree.
+     *
+     * A body qualifies if a scenario flagged it (`isStar`) or if it has grown
+     * into CLASS_STAR since - a merger of two brown dwarfs really does light up,
+     * and it must then start being treated as a star by the force solver and by
+     * fusion. Sorted heaviest first, so `stars[0]` is the dominant star and the
+     * ordering is stable for the HUD.
+     *
+     * Cheap - one O(n) pass - and called only when the body set or a mass could
+     * have changed, never on a quiet step.
+     */
+    refreshStars(){
+        const planets = this.planets
+        const stars = this.stars
+        stars.length = 0
+        for(let i = 0; i < planets.length; i++){
+            const planet = planets[i]
+            if(planet.removed) continue
+            planet.isCentralStar = false
+            planet.starIndex = -1
+            if(planet.isStar || planet.classification === CLASS_STAR){
+                planet.isStar = true
+                stars.push(planet)
+            }
+        }
+        // No star at all - a disk with the star switched off, or a cluster that
+        // has merged away to nothing. The heaviest body then stands in, so the
+        // HUD and the orbital elements still have a reference.
+        if(stars.length === 0){
+            let heaviest = null
+            for(let i = 0; i < planets.length; i++){
+                const planet = planets[i]
+                if(planet.removed) continue
+                if(!heaviest || planet.mass > heaviest.mass) heaviest = planet
+            }
+            this.star = heaviest
+            if(heaviest) heaviest.isCentralStar = true
+            return this.stars
+        }
+        stars.sort((a, b) => b.mass - a.mass)
+        for(let k = 0; k < stars.length; k++)
+            stars[k].starIndex = k
+        this.star = stars[0]
+        this.star.isCentralStar = true
+        return stars
+    }
+
+    /** The dominant star, or the heaviest body if there is none. */
+    findCentralStar(){
+        this.refreshStars()
+        return this.star
     }
 
     /**
-     * Put a body on a Kepler orbit of the given elements around the star, with
-     * random node, periapsis argument and anomaly.
-     *
-     * The perifocal velocity is written in terms of the circular speed at the
-     * same semi-major axis, because
-     *
-     *     sqrt(mu/p) = circularOrbitalSpeed(a) / sqrt(1 - e^2)
-     *
-     * so a body with e = 0 gets exactly circularOrbitalSpeed(a) and the unit
-     * system's defining property (1 AU around 1 Msun closes in 1 year) is
-     * visible in the code rather than buried in a mu.
-     */
-    placeOnOrbit(planet, semiMajorAxis, eccentricity, inclination, centralMass){
-        const node = rand(0, 2 * Math.PI)
-        const periapsis = rand(0, 2 * Math.PI)
-        const anomaly = rand(0, 2 * Math.PI)
-        const cosF = Math.cos(anomaly)
-        const sinF = Math.sin(anomaly)
-        const oneMinusE2 = Math.max(1e-9, 1 - eccentricity * eccentricity)
-        const distance = semiMajorAxis * oneMinusE2 / (1 + eccentricity * cosF)
-        const speed = circularOrbitalSpeed(semiMajorAxis, centralMass) / Math.sqrt(oneMinusE2)
-        // perifocal frame
-        const px = distance * cosF
-        const py = distance * sinF
-        const vx = -speed * sinF
-        const vy = speed * (eccentricity + cosF)
-        // rotate by argument of periapsis, inclination, longitude of node
-        const cosW = Math.cos(periapsis), sinW = Math.sin(periapsis)
-        const cosI = Math.cos(inclination), sinI = Math.sin(inclination)
-        const cosO = Math.cos(node), sinO = Math.sin(node)
-        const m11 = cosO * cosW - sinO * sinW * cosI
-        const m12 = -cosO * sinW - sinO * cosW * cosI
-        const m21 = sinO * cosW + cosO * sinW * cosI
-        const m22 = -sinO * sinW + cosO * cosW * cosI
-        const m31 = sinW * sinI
-        const m32 = cosW * sinI
-        const x = m11 * px + m12 * py
-        const y = m21 * px + m22 * py
-        const z = m31 * px + m32 * py
-        const ux = m11 * vx + m12 * vy
-        const uy = m21 * vx + m22 * vy
-        const uz = m31 * vx + m32 * vy
-        // z-normal frame -> disk plane (normal +y)
-        planet.position.set(x, z, -y)
-        planet.velocity.set(ux, uz, -uy)
-        planet.previousPosition.copyFrom(planet.position)
-        if(this.star){
-            planet.position.add(this.star.position)
-            planet.velocity.add(this.star.velocity)
-            planet.previousPosition.copyFrom(planet.position)
-        }
-        return planet
-    }
-
-    /**
-     * Move to the barycentre and kill the net momentum, star included, so the
+     * Move to the barycentre and kill the net momentum, stars included, so the
      * whole system does not translate off screen over a long run. Scaling is
      * not involved: the orbits were built Keplerian and must stay that way.
+     *
+     * Scenarios do this for themselves (scenarioCenter in scenarios.js); this
+     * stays for callers that assemble bodies by hand.
      */
     conditionInitialState(planets){
         const n = planets.length
@@ -236,29 +245,13 @@ class Simulation{
         return planets
     }
 
-    /** The heaviest body, used when a caller supplies its own planet array. */
-    findCentralStar(){
-        const planets = this.planets
-        let best = null
-        for(let i = 0; i < planets.length; i++){
-            const planet = planets[i]
-            if(planet.isCentralStar)
-                return planet
-            if(!best || planet.mass > best.mass)
-                best = planet
-        }
-        if(best && best.classification === CLASS_STAR){
-            best.isCentralStar = true
-            return best
-        }
-        return null
-    }
-
     /**
-     * Unit vector along the disk's total orbital angular momentum about the
-     * star. randomPlanets() builds the disk in the xz-plane, so this comes out
-     * as +y, but it is measured rather than assumed so a hand-built system
-     * still gets its gas accretion the right way round.
+     * Unit vector along the total orbital angular momentum of the light bodies
+     * about the dominant star. Every scenario here builds its disk in the
+     * xz-plane, so this comes out as +y, but it is measured rather than assumed
+     * so a hand-built system still gets its gas accretion the right way round.
+     * A scenario that knows its own plane passes it in meta.diskNormal and this
+     * is never called.
      */
     measureDiskNormal(){
         const star = this.star
@@ -290,6 +283,9 @@ class Simulation{
     addPlanet(planet){
         this.planets.push(planet)
         this.accelerationsValid = false
+        // A spawned star has to join the direct-sum set before the next step.
+        if(planet.isStar || planet.classification === CLASS_STAR)
+            this.refreshStars()
         for(let i = 0; i < this.spawnedListeners.length; i++)
             this.spawnedListeners[i](planet)
         return planet
@@ -304,8 +300,8 @@ class Simulation{
         planet.removed = true
         if(index >= 0)
             this.planets.splice(index, 1)
-        if(planet === this.star)
-            this.star = null
+        if(planet.isStar)
+            this.refreshStars()
         this.accelerationsValid = false
         this.notifyRemoved(planet)
         return planet
@@ -340,6 +336,7 @@ class Simulation{
         this.previousAccelerationY = new Float64Array(size)
         this.previousAccelerationZ = new Float64Array(size)
         this.treeIndex = new Int32Array(size)
+        this.starOrdinal = new Int32Array(size)
         this.cellX = new Int32Array(size)
         this.cellY = new Int32Array(size)
         this.cellZ = new Int32Array(size)
@@ -362,10 +359,13 @@ class Simulation{
         ay.fill(0, 0, n)
         az.fill(0, 0, n)
         if(this.useBarnesHut && n > BARNES_HUT_MIN_BODIES){
-            // Disk bodies through the tree, the star exactly. The two passes
-            // touch disjoint pairs, so no interaction is counted twice.
+            // Light bodies through the tree, every star exactly. The two passes
+            // touch disjoint pairs - the tree never sees a star and the direct
+            // sum covers every pair involving one - so nothing is counted twice
+            // and nothing is missed.
+            this.markStars(n)
             this.accumulateBarnesHut(n, ax, ay, az)
-            this.accumulateStar(n, ax, ay, az)
+            this.accumulateStars(n, ax, ay, az)
         }else{
             // Brute force is already exact for every pair, star included.
             this.accumulateBruteForce(n, ax, ay, az)
@@ -410,15 +410,41 @@ class Simulation{
         }
     }
 
+    /**
+     * Index every star so the direct sum can find them in one pass.
+     *
+     * starOrdinal[i] is the body's position in this.stars, or -1 if it is not a
+     * star. That single array does two jobs: it tells the tree pass which
+     * bodies to leave out, and it lets the direct sum skip the half of the
+     * star-star pairs it has already visited.
+     */
+    markStars(n){
+        const planets = this.planets
+        const ordinal = this.starOrdinal
+        ordinal.fill(-1, 0, n)
+        if(this.starSlots.length < this.stars.length)
+            this.starSlots = new Int32Array(Math.max(this.stars.length, 8))
+        const slots = this.starSlots
+        slots.fill(-1)
+        for(let i = 0; i < n; i++){
+            const planet = planets[i]
+            if(planet.removed) continue
+            const index = planet.starIndex
+            if(index < 0 || index >= this.stars.length) continue
+            ordinal[i] = index
+            slots[index] = i
+        }
+    }
+
     accumulateBarnesHut(n, ax, ay, az){
         const planets = this.planets
-        const star = this.star
+        const ordinal = this.starOrdinal
         const bodies = this.treeBodies
         const treeIndex = this.treeIndex
         bodies.length = 0
         for(let i = 0; i < n; i++){
             const planet = planets[i]
-            if(planet.removed || planet === star){
+            if(planet.removed || ordinal[i] >= 0){
                 treeIndex[i] = -1
                 continue
             }
@@ -449,7 +475,7 @@ class Simulation{
         // Tree forces are not pair symmetric, so they leave a small spurious net force
         // on the system. Subtracting it as a uniform acceleration restores sum(m*a) = 0
         // without touching any relative acceleration. It is applied only to the bodies
-        // that went through the tree; the star's contribution below is already exact.
+        // that went through the tree; the stars' contribution below is already exact.
         if(totalMass > 0){
             const cx = netX / totalMass, cy = netY / totalMass, cz = netZ / totalMass
             for(let i = 0; i < n; i++){
@@ -462,51 +488,63 @@ class Simulation{
     }
 
     /**
-     * The star's gravity, summed body by body and never through the tree.
+     * The gravity of every star, summed body by body and never through the tree.
      *
-     * It carries ~99.9% of the mass, so the orbit of every body in the disk is
-     * its orbit around this one term; a multipole approximation of it would
-     * dominate the error budget of the whole simulation. O(n) and exact, and
-     * written pair-symmetrically so the star recoils and momentum is conserved
-     * to round-off.
+     * The stars carry almost all of the mass, so the orbit of every light body
+     * is its orbit around these few terms; a multipole approximation of them
+     * would dominate the error budget of the whole simulation. There are only
+     * ever a handful to a few hundred of them, so this is O(S*n) and exact,
+     * against O(n log n) and approximate for everything else.
+     *
+     * Written pair-symmetrically, so each star recoils from everything it pulls
+     * and momentum is conserved to round-off. Star-star pairs are visited once:
+     * the inner loop skips any star whose ordinal is lower than the outer one's,
+     * because that pair was already done.
      */
-    accumulateStar(n, ax, ay, az){
-        const star = this.star
-        if(!star || star.removed || !(star.mass > 0)) return
+    accumulateStars(n, ax, ay, az){
+        const stars = this.stars
+        if(stars.length === 0) return
         const planets = this.planets
-        const index = planets.indexOf(star)
-        if(index < 0) return
+        const ordinal = this.starOrdinal
+        const slots = this.starSlots
         const gravitation = GRAVITATION_CONSTANT
         const eps2 = this.softeningSquared
-        const sx = star.position.x, sy = star.position.y, sz = star.position.z
-        const starMass = star.mass
-        let starX = 0, starY = 0, starZ = 0
-        for(let i = 0; i < n; i++){
-            if(i === index) continue
-            const planet = planets[i]
-            if(planet.removed) continue
-            const dx = sx - planet.position.x
-            const dy = sy - planet.position.y
-            const dz = sz - planet.position.z
-            const s2 = dx * dx + dy * dy + dz * dz + eps2
-            const inv = gravitation / (s2 * Math.sqrt(s2))
-            const toStar = inv * starMass
-            ax[i] += toStar * dx
-            ay[i] += toStar * dy
-            az[i] += toStar * dz
-            const toBody = inv * planet.mass
-            starX -= toBody * dx
-            starY -= toBody * dy
-            starZ -= toBody * dz
+        for(let s = 0; s < stars.length; s++){
+            const star = stars[s]
+            const index = slots[s]
+            if(index < 0 || star.removed || !(star.mass > 0)) continue
+            const sx = star.position.x, sy = star.position.y, sz = star.position.z
+            const starMass = star.mass
+            let starX = 0, starY = 0, starZ = 0
+            for(let i = 0; i < n; i++){
+                if(i === index) continue
+                // already handled when the other star was the outer body
+                if(ordinal[i] >= 0 && ordinal[i] < s) continue
+                const planet = planets[i]
+                if(planet.removed) continue
+                const dx = sx - planet.position.x
+                const dy = sy - planet.position.y
+                const dz = sz - planet.position.z
+                const s2 = dx * dx + dy * dy + dz * dz + eps2
+                const inv = gravitation / (s2 * Math.sqrt(s2))
+                const toStar = inv * starMass
+                ax[i] += toStar * dx
+                ay[i] += toStar * dy
+                az[i] += toStar * dz
+                const toBody = inv * planet.mass
+                starX -= toBody * dx
+                starY -= toBody * dy
+                starZ -= toBody * dz
+            }
+            ax[index] += starX
+            ay[index] += starY
+            az[index] += starZ
         }
-        ax[index] += starX
-        ay[index] += starY
-        az[index] += starZ
     }
 
     // Velocity-Verlet, applied as three separate passes over the whole array so no
     // body ever sees another body that has already moved this step.
-    step(dt = FIXED_DT){
+    step(dt = this.dt){
         if(!isFinite(dt) || dt <= 0) return this
         const planets = this.planets
         const n = planets.length
@@ -555,6 +593,12 @@ class Simulation{
             this.compact()
         if(changes !== 0)
             this.accelerationsValid = false
+        // Anything that moved mass around can have removed a star, or pushed a
+        // body over the hydrogen-burning limit into becoming one. The star list
+        // is what the force solver splits on and what gas accretion feeds from,
+        // so it is refreshed before either of them runs.
+        if(changes !== 0)
+            this.refreshStars()
         if(this.updateGasAccretion(dt))
             this.accelerationsValid = false
         this.updateFusion(dt)
@@ -563,7 +607,7 @@ class Simulation{
         return this
     }
 
-    update(dt = FIXED_DT){
+    update(dt = this.dt){
         return this.step(dt)
     }
 
@@ -602,6 +646,12 @@ class Simulation{
      * physically why giant planets end up on near-circular, near-coplanar
      * orbits: accreting circular material damps eccentricity and inclination.
      *
+     * WITH SEVERAL STARS each body is fed by the star that dominates it - the
+     * one with the largest m/r^2 at its position - and orbits that star's gas.
+     * A body being pulled between two suns is not in anybody's quiet disk and
+     * gets nothing, which is right: there is no ordered gas flow there to
+     * accrete from.
+     *
      * Returns true if anything accreted.
      */
     updateGasAccretion(dt){
@@ -612,22 +662,40 @@ class Simulation{
             this.gasReservoir = 0
             return false
         }
-        const star = this.star
-        if(!star) return false
+        const stars = this.stars
+        if(stars.length === 0) return false
+        const inner = this.meta.gasInnerRadius
+        const outer = this.meta.gasOuterRadius
         const planets = this.planets
         const growthFactor = Math.expm1(dt / GAS_ACCRETION_TIMESCALE)
         const maxThisStep = GAS_ACCRETION_MAX_RATE * dt
         let accreted = false
         for(let i = 0; i < planets.length; i++){
             const planet = planets[i]
-            if(planet.removed || planet === star) continue
+            if(planet.removed || planet.isStar) continue
             if(planet.mass < GAS_ACCRETION_CRITICAL_CORE_MASS) continue
             if(planet.mass >= GAS_ACCRETION_GAP_MASS) continue
+            // The star this body actually belongs to, by gravitational pull.
+            let star = null
+            let distance = 0
+            let strongest = 0
+            for(let k = 0; k < stars.length; k++){
+                const candidate = stars[k]
+                if(candidate.removed) continue
+                const separation = planet.position.distanceTo(candidate.position)
+                if(!(separation > 0)) continue
+                const pull = candidate.mass / (separation * separation)
+                if(pull > strongest){
+                    strongest = pull
+                    star = candidate
+                    distance = separation
+                }
+            }
+            if(!star) continue
+            if(distance < inner || distance > outer) continue
             const dx = planet.position.x - star.position.x
             const dy = planet.position.y - star.position.y
             const dz = planet.position.z - star.position.z
-            const distance = Math.sqrt(dx * dx + dy * dy + dz * dz)
-            if(distance < DISK_INNER_RADIUS || distance > DISK_OUTER_RADIUS) continue
             let growth = planet.mass * growthFactor
             if(growth > maxThisStep) growth = maxThisStep
             if(growth > GAS_ACCRETION_GAP_MASS - planet.mass) growth = GAS_ACCRETION_GAP_MASS - planet.mass
@@ -834,10 +902,12 @@ class Simulation{
         const cz = rz + t * dvz
         if(cx * cx + cy * cy + cz * cz >= contact * contact)
             return 0
-        // The heavier body is always the receiver, and the star always wins.
+        // The heavier body is always the receiver, and a star always wins
+        // against anything that is not one. Two stars fall back to the mass
+        // test, so the heavier of the pair swallows the lighter.
         let donor = a.mass <= b.mass ? a : b
         let receiver = donor === a ? b : a
-        if(donor.isCentralStar){
+        if(donor.isStar && !receiver.isStar){
             const swap = donor
             donor = receiver
             receiver = swap
@@ -851,7 +921,7 @@ class Simulation{
             return this.disruptPair(receiver, donor)
         }
         this.collisions++
-        if(receiver === this.star)
+        if(receiver.isStar)
             this.absorbedByStar++
         donor.mergeInto(receiver)
         donor.removed = true
@@ -940,11 +1010,83 @@ class Simulation{
     }
 
     /**
-     * Osculating orbital elements of a body about the star, computed on demand.
+     * Which body a given planet's orbit should be measured against.
+     *
+     * With one star this is trivially the star. With several it is not, and
+     * getting it wrong makes the reported semi-major axis meaningless, so the
+     * rule is stated here rather than guessed at the call site:
+     *
+     *  1. The PRIMARY is the star with the largest m/r^2 at the body's
+     *     position - the one that actually dominates its motion, which is not
+     *     always the heaviest or the nearest.
+     *  2. Any other star closer to the primary than HALF the body's distance to
+     *     the primary joins the reference set. A body far outside a tight
+     *     binary cannot resolve its two components and is really orbiting their
+     *     combined mass, so it is measured against their BARYCENTRE; a body
+     *     orbiting one member of a wide pair is measured against that member
+     *     alone. The one-half is the usual "hierarchical if the ratio is at
+     *     least two" criterion.
+     *  3. A star is never measured against itself. For a star the reference is
+     *     built from the other stars only, so the two members of a binary each
+     *     report the mutual orbit and the analytic period comes back exactly.
+     *
+     * Fills `out` with mass, position and velocity of the reference, and
+     * returns it, or returns null when there is nothing to measure against.
+     */
+    orbitalReference(planet, out){
+        const stars = this.stars
+        const reference = out || {}
+        let primary = null
+        let strongest = -1
+        for(let i = 0; i < stars.length; i++){
+            const star = stars[i]
+            if(star === planet || star.removed || !(star.mass > 0)) continue
+            const distance = planet.position.distanceSquaredTo(star.position) + this.softeningSquared
+            const pull = star.mass / distance
+            if(pull > strongest){
+                strongest = pull
+                primary = star
+            }
+        }
+        if(!primary) return null
+        const span = 0.5 * planet.position.distanceTo(primary.position)
+        let mass = 0
+        let px = 0, py = 0, pz = 0, vx = 0, vy = 0, vz = 0
+        for(let i = 0; i < stars.length; i++){
+            const star = stars[i]
+            if(star === planet || star.removed || !(star.mass > 0)) continue
+            if(star !== primary && star.position.distanceTo(primary.position) >= span) continue
+            mass += star.mass
+            px += star.mass * star.position.x
+            py += star.mass * star.position.y
+            pz += star.mass * star.position.z
+            vx += star.mass * star.velocity.x
+            vy += star.mass * star.velocity.y
+            vz += star.mass * star.velocity.z
+        }
+        if(!(mass > 0)) return null
+        reference.mass = mass
+        reference.x = px / mass
+        reference.y = py / mass
+        reference.z = pz / mass
+        reference.vx = vx / mass
+        reference.vy = vy / mass
+        reference.vz = vz / mass
+        return reference
+    }
+
+    /**
+     * Osculating orbital elements of a body about its reference (see
+     * orbitalReference above), computed on demand.
      *
      * This is the natural way to read a planetary system: the semi-major axis
      * says where a planet lives and the eccentricity says how violent its
      * neighbourhood is. Pass `out` to reuse an object and allocate nothing.
+     *
+     * Never returns NaN. Every quantity is zeroed first and only overwritten
+     * once its denominator is known to be positive, so a body sitting exactly
+     * on its reference, or a system with no stars left at all, reports zeros
+     * and bound = false rather than poisoning the HUD.
      */
     orbitalElements(planet, out){
         const result = out || {}
@@ -956,20 +1098,24 @@ class Simulation{
         result.apoapsis = 0
         result.distance = 0
         result.bound = false
-        const star = this.star
-        if(!planet || !star || planet === star || !(star.mass > 0))
-            return result
-        const rx = planet.position.x - star.position.x
-        const ry = planet.position.y - star.position.y
-        const rz = planet.position.z - star.position.z
-        const vx = planet.velocity.x - star.velocity.x
-        const vy = planet.velocity.y - star.velocity.y
-        const vz = planet.velocity.z - star.velocity.z
+        result.reference = null
+        if(!planet) return result
+        const reference = this.orbitalReference(planet, this._orbitalReference ||
+            (this._orbitalReference = {}))
+        if(!reference || !(reference.mass > 0)) return result
+        result.reference = reference
+        const rx = planet.position.x - reference.x
+        const ry = planet.position.y - reference.y
+        const rz = planet.position.z - reference.z
+        const vx = planet.velocity.x - reference.vx
+        const vy = planet.velocity.y - reference.vy
+        const vz = planet.velocity.z - reference.vz
         const distance = Math.sqrt(rx * rx + ry * ry + rz * rz)
         if(!(distance > 0)) return result
         result.distance = distance
         // Two-body problem for the pair, so the reduced mass is included.
-        const mu = GRAVITATION_CONSTANT * (star.mass + planet.mass)
+        const mu = GRAVITATION_CONSTANT * (reference.mass + planet.mass)
+        if(!(mu > 0)) return result
         const speedSquared = vx * vx + vy * vy + vz * vz
         // specific angular momentum h = r x v
         const hx = ry * vz - rz * vy
@@ -982,26 +1128,71 @@ class Simulation{
         const ey = (vz * hx - vx * hz) / mu - ry / distance
         const ez = (vx * hy - vy * hx) / mu - rz / distance
         const eccentricity = Math.sqrt(ex * ex + ey * ey + ez * ez)
-        result.eccentricity = eccentricity
-        // Inclination is measured from the disk plane, whose normal is +y.
-        result.inclination = h > 0 ? Math.acos(Math.max(-1, Math.min(1, hy / h))) : 0
+        result.eccentricity = isFinite(eccentricity) ? eccentricity : 0
+        // Inclination is measured from the system's own plane, which for every
+        // scenario built here is the xz-plane with normal +y.
+        if(h > 0){
+            const normal = this.diskNormal
+            const cosine = (hx * normal.x + hy * normal.y + hz * normal.z) / h
+            result.inclination = Math.acos(Math.max(-1, Math.min(1, cosine)))
+        }
         if(energy < 0){
             const semiMajorAxis = -mu / (2 * energy)
             result.semiMajorAxis = semiMajorAxis
             result.bound = true
-            result.period = orbitalPeriod(semiMajorAxis, star.mass + planet.mass)
-            result.periapsis = semiMajorAxis * (1 - eccentricity)
-            result.apoapsis = semiMajorAxis * (1 + eccentricity)
+            result.period = orbitalPeriod(semiMajorAxis, reference.mass + planet.mass)
+            result.periapsis = semiMajorAxis * (1 - result.eccentricity)
+            result.apoapsis = semiMajorAxis * (1 + result.eccentricity)
         }else{
             // Unbound: report the (negative) semi-major axis of the hyperbola.
             result.semiMajorAxis = energy !== 0 ? -mu / (2 * energy) : Infinity
-            result.periapsis = h > 0 ? (h * h / mu) / (1 + eccentricity) : 0
+            result.periapsis = h > 0 ? (h * h / mu) / (1 + result.eccentricity) : 0
             result.apoapsis = Infinity
         }
         return result
     }
 
-    /** Radius where the star heats a grain to SNOW_LINE_TEMPERATURE, in AU. */
+    /**
+     * Equilibrium temperature at a point, heated by EVERY star, in K.
+     *
+     * Irradiation is a flux and fluxes add, so T^4 = SUM_i L_i / (16 pi sigma
+     * r_i^2), which in these units is just the sum of each star's own T(r)^4.
+     * Two identical suns at the same distance make a point 2^(1/4) = 1.19 times
+     * hotter than one would. This is the field scenarios.js assigns formation
+     * compositions from, and it is why a body between two stars comes out dry
+     * when the same body around a single star would be icy.
+     */
+    irradiationTemperatureAt(x, y, z){
+        const stars = this.stars
+        let quartic = 0
+        for(let i = 0; i < stars.length; i++){
+            const star = stars[i]
+            if(star.removed || !(star.effectiveTemperature > 0) || !(star.radius > 0)) continue
+            const dx = x - star.position.x
+            const dy = y - star.position.y
+            const dz = z - star.position.z
+            const distance = Math.sqrt(dx * dx + dy * dy + dz * dz)
+            const temperature = distance <= star.radius
+                ? star.effectiveTemperature
+                : Composition.formationTemperature(distance, star.effectiveTemperature, star.radius)
+            if(isFinite(temperature) && temperature > 0)
+                quartic += temperature * temperature * temperature * temperature
+        }
+        return quartic > 0 ? Math.pow(quartic, 0.25) : 0
+    }
+
+    /**
+     * Radius around the DOMINANT star at which it alone heats a grain to
+     * SNOW_LINE_TEMPERATURE, in AU. For the HUD.
+     *
+     * WITH SEVERAL STARS THE SNOW LINE IS NOT A RADIUS. It is a level set of
+     * irradiationTemperatureAt() - a surface that wraps each star, bulges
+     * outward in the space between them where both suns shine at once, and is
+     * not centred on anything. This number is the radius the dominant star
+     * would put it at on its own, which is the right single figure to show and
+     * an underestimate of the true line everywhere a second star contributes.
+     * Composition assignment uses the summed field, never this.
+     */
     get snowLineRadius(){
         const star = this.star
         return Composition.snowLineRadius(
@@ -1042,7 +1233,9 @@ class Simulation{
                 case CLASS_PLANET: rocky++; break
                 default: asteroids++; break
             }
-            if(planet === star) continue
+            // "Disk mass" is everything that is not a star, whatever the
+            // scenario: in a cluster that is zero, which is correct.
+            if(planet.isStar) continue
             diskMass += planet.mass
             if(!mostMassive || planet.mass > mostMassive.mass)
                 mostMassive = planet
@@ -1061,6 +1254,10 @@ class Simulation{
         const clamped = table ? Math.min(maxElementIndex, table.length - 1) : maxElementIndex
         return {
             count: n,
+            scenarioId: this.scenarioId,
+            scenarioLabel: this.meta.label,
+            scenarioNotes: this.meta.notes,
+            meta: this.meta,
             simulatedTime: this.time,
             steps: this.steps,
             totalMass,
@@ -1075,6 +1272,8 @@ class Simulation{
             classCounts: classCounts,
             counts: classCounts,
             star: star,
+            stars: this.stars,
+            starCount: this.stars.length,
             largestBody: mostMassive,
             mostMassive: mostMassive,
             largestMass: mostMassive ? mostMassive.mass : 0,

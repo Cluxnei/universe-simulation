@@ -1048,3 +1048,456 @@ canvas {
         display: none;
     }
 }
+
+/* ==========================================================================
+   launch screen — scenario picker, shown before the simulation starts
+   --------------------------------------------------------------------------
+   Same tokens as the overlay panels, but at dialog scale: this is the first
+   thing the user sees, so it reads as a title screen rather than as a form.
+   ========================================================================== */
+
+.nv-launch {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    font-family: var(--nv-font);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--nv-text);
+    background:
+        radial-gradient(1200px 700px at 50% -10%, rgba(60, 110, 190, 0.22), transparent 70%),
+        rgba(2, 4, 9, 0.86);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    -webkit-font-smoothing: antialiased;
+}
+
+.nv-launch--on {
+    display: flex;
+}
+
+.nv-launch__dialog {
+    display: flex;
+    flex-direction: column;
+    width: min(1040px, 100%);
+    max-height: 100%;
+    background: var(--nv-panel-bg-solid);
+    border: 1px solid var(--nv-border-strong);
+    border-radius: 14px;
+    box-shadow: 0 30px 90px rgba(0, 0, 0, 0.7);
+    overflow: hidden;
+}
+
+.nv-launch__header {
+    padding: 18px 22px 14px;
+    border-bottom: 1px solid var(--nv-border);
+    background: linear-gradient(180deg, rgba(111, 211, 255, 0.10), rgba(111, 211, 255, 0));
+}
+
+.nv-launch__title {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.20em;
+    text-transform: uppercase;
+    color: var(--nv-accent);
+}
+
+.nv-launch__subtitle {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--nv-dim);
+}
+
+.nv-launch__body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 0;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.nv-launch__left {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    min-height: 0;
+    padding: 14px 16px 16px;
+    border-right: 1px solid var(--nv-border);
+}
+
+.nv-launch__filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    flex: 0 0 auto;
+}
+
+.nv-launch__cards {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: 52vh;
+    overflow-y: auto;
+    margin: 0 -4px;
+    padding: 2px 4px;
+}
+
+.nv-launch__cards::-webkit-scrollbar,
+.nv-launch__right::-webkit-scrollbar {
+    width: 8px;
+}
+
+.nv-launch__cards::-webkit-scrollbar-thumb,
+.nv-launch__right::-webkit-scrollbar-thumb {
+    background: rgba(120, 168, 255, 0.22);
+    border-radius: 8px;
+}
+
+/* --- one card per scenario ---------------------------------------------- */
+
+.nv-scenario {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 100%;
+    padding: 9px 11px;
+    text-align: left;
+    font-family: inherit;
+    font-size: 12px;
+    color: var(--nv-text);
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid var(--nv-border);
+    border-radius: 9px;
+    cursor: pointer;
+    transition: background 0.14s, border-color 0.14s, transform 0.14s;
+}
+
+.nv-scenario:hover {
+    background: rgba(111, 211, 255, 0.09);
+    border-color: var(--nv-border-strong);
+}
+
+.nv-scenario:focus-visible,
+.nv-launch__dialog button:focus-visible,
+.nv-launch__dialog select:focus-visible,
+.nv-launch__dialog input:focus-visible {
+    outline: 2px solid var(--nv-accent);
+    outline-offset: 2px;
+}
+
+.nv-scenario--active {
+    background: var(--nv-accent-soft);
+    border-color: var(--nv-accent);
+}
+
+.nv-scenario__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.nv-scenario__name {
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+.nv-scenario__description {
+    color: var(--nv-dim);
+    font-size: 11px;
+}
+
+.nv-scenario__category,
+.nv-launch__category {
+    flex: 0 0 auto;
+    padding: 1px 7px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--nv-gold);
+    background: rgba(255, 196, 107, 0.12);
+    border: 1px solid rgba(255, 196, 107, 0.30);
+    border-radius: 999px;
+    white-space: nowrap;
+}
+
+.nv-scenario__category[data-category="colisao"],
+.nv-launch__category[data-category="colisao"] {
+    color: var(--nv-warn);
+    background: rgba(255, 143, 122, 0.12);
+    border-color: rgba(255, 143, 122, 0.32);
+}
+
+.nv-scenario__category[data-category="multiplo"],
+.nv-launch__category[data-category="multiplo"],
+.nv-scenario__category[data-category="aglomerado"],
+.nv-launch__category[data-category="aglomerado"] {
+    color: var(--nv-accent);
+    background: rgba(111, 211, 255, 0.12);
+    border-color: rgba(111, 211, 255, 0.32);
+}
+
+.nv-launch__empty {
+    padding: 10px 2px;
+    color: var(--nv-faint);
+}
+
+/* --- the parameter column ----------------------------------------------- */
+
+.nv-launch__right {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 0;
+    padding: 14px 16px 16px;
+    overflow-y: auto;
+    max-height: 60vh;
+}
+
+.nv-launch__detailhead {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.nv-launch__name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--nv-text);
+}
+
+.nv-launch__description {
+    color: var(--nv-dim);
+    font-size: 11px;
+}
+
+.nv-launch__kept {
+    padding: 6px 9px;
+    font-size: 11px;
+    color: var(--nv-gold);
+    background: rgba(255, 196, 107, 0.08);
+    border: 1px solid rgba(255, 196, 107, 0.28);
+    border-radius: 7px;
+}
+
+.nv-params {
+    display: flex;
+    flex-direction: column;
+    gap: 11px;
+    padding-top: 3px;
+}
+
+.nv-params__empty {
+    color: var(--nv-faint);
+    font-size: 11px;
+}
+
+.nv-param {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 9px 11px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--nv-border);
+    border-radius: 9px;
+}
+
+.nv-param__head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.nv-param__label {
+    color: var(--nv-text);
+    font-size: 11px;
+}
+
+.nv-param__value {
+    color: var(--nv-accent);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.nv-param__inputs {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.nv-param__range {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 18px;
+    accent-color: var(--nv-accent);
+    background: transparent;
+    cursor: pointer;
+}
+
+.nv-param__number {
+    flex: 0 0 auto;
+    width: 84px;
+    padding: 4px 6px;
+    font-family: inherit;
+    font-size: 11px;
+    color: var(--nv-text);
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--nv-border);
+    border-radius: 6px;
+    outline: none;
+    font-variant-numeric: tabular-nums;
+}
+
+.nv-param__select {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 4px 6px;
+    font-family: inherit;
+    font-size: 11px;
+    color: var(--nv-text);
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--nv-border);
+    border-radius: 6px;
+    outline: none;
+}
+
+.nv-param__select option {
+    background: #0b111c;
+    color: var(--nv-text);
+}
+
+.nv-param__check {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--nv-accent);
+    cursor: pointer;
+}
+
+.nv-param__unit {
+    flex: 0 0 auto;
+    color: var(--nv-faint);
+    font-size: 11px;
+}
+
+.nv-param__help {
+    color: var(--nv-faint);
+    font-size: 10px;
+}
+
+/* --- error banner and footer -------------------------------------------- */
+
+.nv-launch__error {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 0 16px;
+    padding: 9px 12px;
+    color: var(--nv-warn);
+    background: rgba(255, 143, 122, 0.10);
+    border: 1px solid rgba(255, 143, 122, 0.36);
+    border-radius: 8px;
+}
+
+.nv-launch__error p {
+    min-width: 0;
+}
+
+.nv-launch__error .nv-button {
+    flex: 0 0 auto;
+}
+
+.nv-launch__footer {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 12px 16px 14px;
+    border-top: 1px solid var(--nv-border);
+}
+
+.nv-launch__spacer {
+    flex: 1 1 auto;
+}
+
+.nv-launch__start {
+    min-width: 172px;
+    padding: 8px 18px;
+    font-size: 12px;
+}
+
+/* the stage itself could not be built */
+.nv-fatal {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 24px;
+    text-align: center;
+    font-family: var(--nv-font);
+    color: var(--nv-text);
+    background: #05070d;
+}
+
+.nv-fatal h1 {
+    font-size: 14px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--nv-warn);
+}
+
+.nv-fatal p {
+    max-width: 520px;
+    font-size: 12px;
+    color: var(--nv-dim);
+}
+
+.nv-fatal__detail {
+    color: var(--nv-faint);
+    font-size: 11px;
+}
+
+@media (max-width: 820px), (max-height: 620px) {
+    .nv-launch {
+        padding: 10px;
+    }
+
+    .nv-launch__body {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .nv-launch__left {
+        border-right: none;
+        border-bottom: 1px solid var(--nv-border);
+    }
+
+    .nv-launch__cards {
+        max-height: 28vh;
+    }
+
+    .nv-launch__right {
+        max-height: 38vh;
+    }
+
+    .nv-launch__footer {
+        flex-wrap: wrap;
+    }
+
+    .nv-launch__start {
+        min-width: 120px;
+        flex: 1 1 auto;
+    }
+}

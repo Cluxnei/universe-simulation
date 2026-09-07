@@ -5,10 +5,21 @@
  * Everything visual lives here.
  *
  * WHAT IS ON SCREEN
- *   - every disk body as one instance of a single InstancedMesh (one draw call)
- *   - the host star as its own mesh, so it can carry a blackbody colour, an
- *     additive halo and the point light that illuminates the disk
+ *   - every body as one instance of a single InstancedMesh (one draw call)
+ *   - every STAR as its own small mesh, so it can carry a blackbody colour and
+ *     an additive halo; the brightest few also carry a point light
  *   - optional guides: concentric rings in the disk plane plus the snow line
+ *
+ * LIFECYCLE
+ *   The stage (renderer, scene, camera, ambient light) is built ONCE and lives
+ *   for the whole page: a WebGL context is expensive and browsers only allow a
+ *   handful of them. Everything that belongs to a single run - the bodies, the
+ *   stars, the guides, the orbit layer, the simulation, the UI and the camera
+ *   controller - is built by buildRun() and released by teardownRun(), so the
+ *   user can pick a different scenario without reloading the page.
+ *
+ *   Every allocation in buildRun() has a matching release in teardownRun();
+ *   that pairing is the whole reason restarts do not leak.
  *
  * UNITS: solar masses, astronomical units, years. `simulatedTime` is in YEARS.
  */
@@ -16,21 +27,34 @@
 let camera, controls, scene, renderer, simulation, cameraController, ui;
 let PERIODIC_TABLE_ELEMENTS;
 
+// Everything a single run owns hangs off this group, so teardown is one
+// remove() plus an explicit dispose of the resources we allocated.
+let world = null;
+
 let bodyMesh = null;
+let textureLibrary = null;   // procedural body textures
+let detailBodies = null;    // LOD pool of textured spheres
+let bodyGeometry = null;
+let bodyMaterial = null;
 let planetIds = [];
 let pickables = [];
 
-// Host star visuals. The star is drawn outside the InstancedMesh because it is
-// ~1e6 times more massive than an embryo and it emits light: it needs its own
-// material, its own halo and its own point light.
-let starGroup = null;
-let starCore = null;
-let starGlow = null;
-let starLight = null;
+// Star visuals. Stars are drawn outside the InstancedMesh because they emit
+// light: they need their own material, their own halo and (for the brightest
+// few) a point light. A cluster can hold tens of them, so the visuals are
+// POOLED - the meshes are created once and reused, never rebuilt per frame.
+let starLayer = null;
+let starGeometry = null;            // shared by every star core
+let starGlowTexture = null;         // shared by every halo sprite
+let starVisuals = [];               // pool of visuals, index-aligned with starList
+let starVisualCount = 0;            // how many of them are in use this frame
+const starSet = new Set();          // bodies that own a visual, skipped by the InstancedMesh
 
 // Disk guides (rings + snow line), toggled with `O`.
 let guides = null;
 let guidesVisible = true;
+let guideGeometry = null;
+let guideMaterials = [];
 let snowLineRing = null;
 let lastSnowLineRadius = -1;
 
@@ -39,7 +63,6 @@ const _matrix = new THREE.Matrix4();
 const _position = new THREE.Vector3();
 const _quaternion = new THREE.Quaternion();
 const _scale = new THREE.Vector3();
-const _starColor = new THREE.Color();
 // Body colours are CSS strings that repeat across hundreds of bodies. Parsing
 // them every frame is pure waste, so keep one THREE.Color per distinct string.
 const colorCache = new Map();
@@ -53,6 +76,37 @@ let simulatedYears = 0;
 let yearsWindow = 0;
 let clockWindow = 0;
 let yearsPerSecond = 0;
+
+// --- the active scenario -------------------------------------------------
+let activeScenarioId = null;
+let activeParams = null;
+let activeMeta = null;
+let activeLabel = '';
+let activeDt = 0.0035;
+let sceneRadius = 20;               // AU, the size of the thing being simulated
+let running = false;                // a run is built and stepping
+let frameCounter = 0;
+let renderFaults = 0;
+
+// Scenario picker (built lazily, kept alive between runs so the parameters the
+// user typed survive a "Trocar cenário").
+let picker = null;
+
+// Handlers registered on the simulation, kept so they can be dropped again.
+let onRemovedHandler = null;
+let onSpawnedHandler = null;
+
+// ---------------------------------------------------------------------------
+// Defensive reads of constants.js
+// ---------------------------------------------------------------------------
+
+function numberOr(value, fallback) {
+    return (typeof value === 'number' && isFinite(value)) ? value : fallback;
+}
+
+function positiveOr(value, fallback) {
+    return (typeof value === 'number' && isFinite(value) && value > 0) ? value : fallback;
+}
 
 // ---------------------------------------------------------------------------
 // Render radius (poetic licence)
@@ -100,8 +154,7 @@ function resolveRenderRadiusMapping() {
         isFinite(RENDER_RADIUS_SCALE) && RENDER_RADIUS_SCALE > 0)
         ? RENDER_RADIUS_SCALE : RENDER_RADIUS_SCALE_CALIBRATED;
 
-    const solarRadius = (typeof SOLAR_RADIUS === 'number' && SOLAR_RADIUS > 0)
-        ? SOLAR_RADIUS : 4.65e-3;
+    const solarRadius = positiveOr(typeof SOLAR_RADIUS !== 'undefined' ? SOLAR_RADIUS : 0, 4.65e-3);
 
     // The star is the largest thing in the scene by a wide margin. If even it
     // saturates the ceiling then so does everything else, and the mapping has
@@ -169,62 +222,129 @@ function colorOf(planet) {
 }
 
 // ---------------------------------------------------------------------------
-// The host star
+// Stars
 // ---------------------------------------------------------------------------
+//
+// simulation.stars is the contract: an array of the luminous bodies, because a
+// scenario may be a binary, a trinary or a whole cluster. simulation.star (the
+// dominant one) is kept as a fallback, and when neither exists the bodies are
+// scanned - rarely, because that scan is O(n) and runs from the render loop.
 
 const WHITE = new THREE.Color(0xffffff);
 
-let starCache = null;
+// Hard caps. Halo sprites are cheap (one quad each) but point lights are not:
+// every extra light is a per-fragment cost in the Lambert shader AND a shader
+// recompile when the count changes, so only the few brightest stars get one.
+const STAR_VISUAL_LIMIT = 64;
+const STAR_LIGHT_LIMIT = 4;
+// Blackbody colour moves on the fusion timescale, so recomputing it for every
+// star on every frame is pure waste. Refresh a star's colour this often.
+const STAR_COLOR_INTERVAL = 12;     // frames
+
+let starList = [];                  // reused every frame, never reallocated
+let starScanCache = [];
 let starProbeCountdown = 0;
 
-/**
- * The central star, from the contract when it exists and from a rare O(n) scan
- * when it does not. The scan is throttled hard because it runs in the render
- * loop; the star does not change identity often enough to justify more.
- */
-function currentStar() {
-    if (simulation && simulation.star && !simulation.star.removed) {
-        starCache = simulation.star;
-        return starCache;
+/** Is this body one the renderer should treat as a star? */
+function looksLikeStar(planet) {
+    if (!planet || planet.removed) {
+        return false;
     }
-    if (starCache && !starCache.removed) {
-        return starCache;
-    }
-    starCache = null;
-    if (starProbeCountdown-- > 0) {
-        return null;
-    }
-    starProbeCountdown = 120;
-
-    const planets = (simulation && Array.isArray(simulation.planets)) ? simulation.planets : null;
-    if (!planets) {
-        return null;
-    }
-    const threshold = (typeof HYDROGEN_BURNING_MASS === 'number') ? HYDROGEN_BURNING_MASS : 0.08;
-    let best = null;
-    for (let i = 0; i < planets.length; i++) {
-        const planet = planets[i];
-        if (!planet || planet.removed) {
-            continue;
-        }
-        // isLuminous is deliberately NOT part of this test: structure.js gives
-        // even a gas giant a residual contraction luminosity, so it would match
-        // half the disk. Only a real star gets the star treatment.
-        const isStar = planet.isCentralStar === true ||
-            planet.classification === 'star' ||
-            (typeof planet.mass === 'number' && planet.mass >= threshold);
-        if (!isStar) {
-            continue;
-        }
-        if (!best || planet.mass > best.mass) {
-            best = planet;
-        }
-    }
-    starCache = best;
-    return best;
+    // isLuminous is deliberately NOT part of this test: structure.js gives even
+    // a gas giant a residual contraction luminosity, so it would match half the
+    // disk. Only a real star gets the star treatment.
+    const threshold = positiveOr(typeof HYDROGEN_BURNING_MASS !== 'undefined' ? HYDROGEN_BURNING_MASS : 0, 0.08);
+    return planet.isCentralStar === true ||
+        planet.classification === 'star' ||
+        (typeof planet.mass === 'number' && planet.mass >= threshold);
 }
 
-/** Colour of the star's own emission: blackbody first, then whatever it says. */
+function compareByMassDescending(a, b) {
+    return (b && typeof b.mass === 'number' ? b.mass : 0) -
+        (a && typeof a.mass === 'number' ? a.mass : 0);
+}
+
+/** Rescan every body for stars. Throttled by the caller; allocates nothing. */
+function scanForStars() {
+    starScanCache.length = 0;
+    const planets = (simulation && Array.isArray(simulation.planets)) ? simulation.planets : null;
+    if (!planets) {
+        return;
+    }
+    for (let i = 0; i < planets.length; i++) {
+        const planet = planets[i];
+        if (!planet || !planet.position || !looksLikeStar(planet)) {
+            continue;
+        }
+        starScanCache.push(planet);
+        if (starScanCache.length >= STAR_VISUAL_LIMIT) {
+            break;
+        }
+    }
+    starScanCache.sort(compareByMassDescending);
+}
+
+/**
+ * The live stars, most massive first. Reuses one array, so the caller must not
+ * hold on to it across frames.
+ */
+function collectStars() {
+    const out = starList;
+    out.length = 0;
+    if (!simulation) {
+        return out;
+    }
+
+    // 1. the contract
+    const declared = simulation.stars;
+    if (Array.isArray(declared)) {
+        for (let i = 0; i < declared.length && out.length < STAR_VISUAL_LIMIT; i++) {
+            const star = declared[i];
+            if (star && !star.removed && star.position) {
+                out.push(star);
+            }
+        }
+        if (out.length > 0) {
+            starScanCache.length = 0;
+            out.sort(compareByMassDescending);
+            return out;
+        }
+    }
+
+    // 2. the single-star fallback
+    const single = simulation.star;
+    if (single && !single.removed && single.position) {
+        starScanCache.length = 0;
+        out.push(single);
+        return out;
+    }
+
+    // 3. our own detection, throttled hard: it is O(n) from inside the frame.
+    let stale = starProbeCountdown-- <= 0;
+    for (let i = 0; i < starScanCache.length && !stale; i++) {
+        if (starScanCache[i].removed) {
+            stale = true;
+        }
+    }
+    if (stale) {
+        starProbeCountdown = 120;
+        scanForStars();
+    }
+    for (let i = 0; i < starScanCache.length && out.length < STAR_VISUAL_LIMIT; i++) {
+        const star = starScanCache[i];
+        if (star && !star.removed && star.position) {
+            out.push(star);
+        }
+    }
+    return out;
+}
+
+/** The dominant star, or null. Used for the HUD and the guides. */
+function dominantStar() {
+    return starList.length > 0 ? starList[0] : null;
+}
+
+/** Colour of a star's own emission: blackbody first, then whatever it says. */
 function starColorHex(star) {
     if (star && typeof blackbodyColorHex === 'function') {
         const temperature = star.effectiveTemperature;
@@ -247,7 +367,7 @@ function starColorHex(star) {
  * A soft radial falloff, drawn once into a canvas and used as the halo sprite.
  * There is no EffectComposer or UnrealBloomPass in js/libs (only three.js and
  * OrbitControls are vendored, and we may not add files), so the glow is faked
- * with an additive sprite. It costs one quad.
+ * with an additive sprite. It costs one quad per star.
  */
 function createGlowTexture() {
     const size = 128;
@@ -271,21 +391,35 @@ function createGlowTexture() {
     return texture;
 }
 
-function createStar() {
-    starGroup = new THREE.Group();
-    starGroup.name = 'star';
-    starGroup.visible = false;
+function createStarLayer() {
+    starLayer = new THREE.Group();
+    starLayer.name = 'stars';
+    // One geometry and one texture for every star in the scene: only the
+    // materials (which carry the colour) are per-star.
+    starGeometry = new THREE.SphereGeometry(1, 32, 24);
+    starGlowTexture = createGlowTexture();
+    starVisuals = [];
+    starVisualCount = 0;
+    starSet.clear();
+    return starLayer;
+}
 
-    starCore = new THREE.Mesh(
-        new THREE.SphereGeometry(1, 32, 24),
+/** Create one star visual and park it in the pool. */
+function createStarVisual(index) {
+    const group = new THREE.Group();
+    group.name = 'star' + index;
+    group.visible = false;
+
+    const core = new THREE.Mesh(
+        starGeometry,
         new THREE.MeshBasicMaterial({ color: 0xfff2d8, fog: false, toneMapped: false })
     );
-    starCore.frustumCulled = false;
-    starCore.name = 'starCore';
-    starGroup.add(starCore);
+    core.frustumCulled = false;
+    core.name = 'starCore' + index;
+    group.add(core);
 
-    starGlow = new THREE.Sprite(new THREE.SpriteMaterial({
-        map: createGlowTexture(),
+    const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: starGlowTexture,
         color: 0xfff2d8,
         blending: THREE.AdditiveBlending,
         transparent: true,
@@ -297,54 +431,290 @@ function createStar() {
         depthTest: true,
         toneMapped: false
     }));
-    starGlow.frustumCulled = false;
+    glow.frustumCulled = false;
     // never pickable: clicks must land on the core, not on the halo
-    starGlow.raycast = function () { };
-    starGroup.add(starGlow);
+    glow.raycast = function () { };
+    group.add(glow);
 
-    // Materials are Lambert, so the disk is genuinely lit by the star. distance
+    // Materials are Lambert, so bodies are genuinely lit by the stars. distance
     // 0 disables attenuation: at 20 AU a physically attenuated light would leave
-    // the outer disk black.
-    starLight = new THREE.PointLight(0xffffff, 1.4, 0);
-    starGroup.add(starLight);
+    // the outer disk black. Only the first few stars carry one.
+    let light = null;
+    if (index < STAR_LIGHT_LIMIT) {
+        light = new THREE.PointLight(0xffffff, 1.4, 0);
+        group.add(light);
+    }
 
-    return starGroup;
+    const visual = {
+        group: group,
+        core: core,
+        glow: glow,
+        light: light,
+        planet: null,
+        lastHex: '',
+        colorTimer: index
+    };
+    starLayer.add(group);
+    starVisuals.push(visual);
+    return visual;
 }
 
-/** Place and colour the star; hide it entirely when there is no star. */
-function syncStar() {
-    const star = currentStar();
-    if (!starGroup) {
+/**
+ * Place and colour one visual per live star, hiding the surplus.
+ *
+ * COST WITH MANY STARS. The pool is created once and only ever mutated, so a
+ * cluster of fifty stars is fifty position/scale writes plus, once every
+ * STAR_COLOR_INTERVAL frames, one blackbody lookup each. Nothing is allocated
+ * and nothing is rebuilt.
+ */
+function syncStars() {
+    if (!starLayer) {
         return;
     }
-    if (!star || !star.position) {
-        // starCore is handed to the raycaster directly, so hiding only the
-        // group would still leave an invisible pickable in front of the disk.
-        starGroup.visible = false;
-        starCore.visible = false;
-        starCore.userData.planet = null;
-        return;
+    const stars = collectStars();
+    const wanted = Math.min(stars.length, STAR_VISUAL_LIMIT);
+    const boost = positiveOr(typeof STAR_EMISSIVE_BOOST !== 'undefined' ? STAR_EMISSIVE_BOOST : 0, 1);
+
+    let pickablesDirty = (wanted !== starVisualCount);
+    starSet.clear();
+
+    for (let i = 0; i < wanted; i++) {
+        const star = stars[i];
+        let visual = starVisuals[i];
+        if (!visual) {
+            visual = createStarVisual(i);
+            pickablesDirty = true;
+        }
+        starSet.add(star);
+
+        visual.planet = star;
+        visual.group.visible = true;
+        visual.core.visible = true;
+        visual.group.position.set(star.position.x, star.position.y, star.position.z);
+        visual.core.userData.planet = star;
+
+        const radius = displayRadiusOf(star);
+        visual.core.scale.setScalar(radius);
+        visual.glow.scale.setScalar(radius * 10);
+
+        // Colour changes on the fusion timescale: refresh it on a stagger.
+        if (visual.colorTimer-- <= 0 || visual.lastHex === '') {
+            visual.colorTimer = STAR_COLOR_INTERVAL;
+            const hex = starColorHex(star);
+            if (hex !== visual.lastHex) {
+                visual.lastHex = hex;
+                const color = cachedColor(hex);
+                // The halo keeps the honest blackbody hue; the core is the same
+                // hue driven past 1.0 by the emissive boost, which is what makes
+                // a photographed star read as a white disc with a coloured corona.
+                visual.glow.material.color.copy(color);
+                visual.core.material.color.copy(color).multiplyScalar(boost);
+                if (visual.light) {
+                    visual.light.color.copy(color).lerp(WHITE, 0.6);
+                }
+            }
+        }
     }
 
-    starGroup.visible = true;
-    starCore.visible = true;
-    starGroup.position.set(star.position.x, star.position.y, star.position.z);
-    starCore.userData.planet = star;
+    // Hide the surplus. The core is handed to the raycaster directly, so hiding
+    // only the group would leave an invisible pickable floating in the scene.
+    for (let i = wanted; i < starVisuals.length; i++) {
+        const visual = starVisuals[i];
+        if (visual.group.visible) {
+            visual.group.visible = false;
+            visual.core.visible = false;
+            visual.core.userData.planet = null;
+            visual.planet = null;
+            pickablesDirty = true;
+        }
+    }
 
-    const radius = displayRadiusOf(star);
-    starCore.scale.setScalar(radius);
-    starGlow.scale.setScalar(radius * 10);
+    starVisualCount = wanted;
+    if (pickablesDirty) {
+        rebuildPickables();
+    }
+}
 
-    const boost = (typeof STAR_EMISSIVE_BOOST === 'number' && STAR_EMISSIVE_BOOST > 0)
-        ? STAR_EMISSIVE_BOOST : 1;
-    _starColor.set(starColorHex(star));
+/** The raycast roots handed to CameraController. */
+/**
+ * Hand the detail pool the current selection so it prioritises what the user is
+ * looking at. Must run BEFORE syncInstances, which skips whatever it claims.
+ */
+function updateDetailBodies() {
+    if (!detailBodies || !simulation) {
+        return;
+    }
+    try {
+        detailBodies.update(simulation.planets, camera, {
+            selected: cameraController ? cameraController.getSelected() : null,
+            followed: cameraController ? cameraController.getFollowed() : null
+        });
+    } catch (e) {
+        // Never let a cosmetic layer kill the animation frame.
+        detailBodies = null;
+    }
+}
 
-    // The halo keeps the honest blackbody hue; the core is the same hue driven
-    // past 1.0 by the emissive boost, which is what makes a photographed star
-    // read as a white disc with a coloured corona.
-    starGlow.material.color.copy(_starColor);
-    starCore.material.color.copy(_starColor).multiplyScalar(boost);
-    starLight.color.copy(_starColor).lerp(WHITE, 0.6);
+function rebuildPickables() {
+    pickables.length = 0;
+    if (bodyMesh) {
+        pickables.push(bodyMesh);
+    }
+    for (let i = 0; i < starVisualCount; i++) {
+        pickables.push(starVisuals[i].core);
+    }
+}
+
+// --- the gravitational focus an orbit should be drawn around ---------------
+//
+// With one star the focus is that star. With several it depends where the body
+// is: a circumbinary planet orbits the pair's barycentre, while a planet inside
+// a wide binary orbits its own host. Picking the wrong one draws a nonsense
+// ellipse, so the choice is made per body, from the geometry.
+
+const _starField = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, mass: 0, spread: 0, count: 0 };
+const _focus = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, mass: 0 };
+
+/** Barycentre, total mass and spread of the star system. Once per frame. */
+function updateStarField() {
+    const field = _starField;
+    field.x = field.y = field.z = 0;
+    field.vx = field.vy = field.vz = 0;
+    field.mass = 0;
+    field.spread = 0;
+    field.count = starList.length;
+    if (field.count === 0) {
+        return;
+    }
+    let mass = 0;
+    for (let i = 0; i < starList.length; i++) {
+        const star = starList[i];
+        const m = (typeof star.mass === 'number' && isFinite(star.mass) && star.mass > 0) ? star.mass : 0;
+        const p = star.position;
+        if (!p || !isFinite(p.x) || !isFinite(p.y) || !isFinite(p.z)) {
+            continue;
+        }
+        const v = star.velocity || { x: 0, y: 0, z: 0 };
+        field.x += p.x * m;
+        field.y += p.y * m;
+        field.z += p.z * m;
+        field.vx += (v.x || 0) * m;
+        field.vy += (v.y || 0) * m;
+        field.vz += (v.z || 0) * m;
+        mass += m;
+    }
+    if (mass > 0) {
+        field.x /= mass;
+        field.y /= mass;
+        field.z /= mass;
+        field.vx /= mass;
+        field.vy /= mass;
+        field.vz /= mass;
+    }
+    field.mass = mass;
+
+    for (let i = 0; i < starList.length; i++) {
+        const p = starList[i].position;
+        if (!p) {
+            continue;
+        }
+        const dx = p.x - field.x, dy = p.y - field.y, dz = p.z - field.z;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (d > field.spread) {
+            field.spread = d;
+        }
+    }
+}
+
+/**
+ * The focus to draw `planet`'s orbit around: the whole star system when the
+ * body is far outside it, otherwise the star that dominates locally (max
+ * m/r^2). Writes into a scratch object; returns null when there is no star.
+ */
+function focusFor(planet) {
+    const field = _starField;
+    if (field.count === 0 || !(field.mass > 0)) {
+        return null;
+    }
+    const p = planet.position;
+    if (!p) {
+        return null;
+    }
+    if (field.count === 1) {
+        const star = starList[0];
+        const v = star.velocity || { x: 0, y: 0, z: 0 };
+        _focus.x = star.position.x; _focus.y = star.position.y; _focus.z = star.position.z;
+        _focus.vx = v.x || 0; _focus.vy = v.y || 0; _focus.vz = v.z || 0;
+        _focus.mass = (typeof star.mass === 'number') ? star.mass : 0;
+        return _focus;
+    }
+
+    const dx = p.x - field.x, dy = p.y - field.y, dz = p.z - field.z;
+    const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (distance > field.spread * 3) {
+        // far outside the pair: it orbits the barycentre of the whole system
+        _focus.x = field.x; _focus.y = field.y; _focus.z = field.z;
+        _focus.vx = field.vx; _focus.vy = field.vy; _focus.vz = field.vz;
+        _focus.mass = field.mass;
+        return _focus;
+    }
+
+    let best = null;
+    let bestPull = -Infinity;
+    for (let i = 0; i < starList.length; i++) {
+        const star = starList[i];
+        const sp = star.position;
+        if (!sp) {
+            continue;
+        }
+        const ex = p.x - sp.x, ey = p.y - sp.y, ez = p.z - sp.z;
+        const r2 = ex * ex + ey * ey + ez * ez;
+        const mass = (typeof star.mass === 'number' && star.mass > 0) ? star.mass : 0;
+        const pull = (r2 > 1e-12) ? mass / r2 : Infinity;
+        if (pull > bestPull) {
+            bestPull = pull;
+            best = star;
+        }
+    }
+    if (!best) {
+        return null;
+    }
+    const v = best.velocity || { x: 0, y: 0, z: 0 };
+    _focus.x = best.position.x; _focus.y = best.position.y; _focus.z = best.position.z;
+    _focus.vx = v.x || 0; _focus.vy = v.y || 0; _focus.vz = v.z || 0;
+    _focus.mass = (typeof best.mass === 'number') ? best.mass : 0;
+    return _focus;
+}
+
+function disposeStarLayer() {
+    for (let i = 0; i < starVisuals.length; i++) {
+        const visual = starVisuals[i];
+        visual.core.material.dispose();
+        visual.glow.material.dispose();
+        visual.core.userData.planet = null;
+        visual.planet = null;
+        if (visual.light && visual.light.parent) {
+            visual.light.parent.remove(visual.light);
+        }
+    }
+    starVisuals.length = 0;
+    starVisualCount = 0;
+    starSet.clear();
+    starList.length = 0;
+    starScanCache.length = 0;
+    starProbeCountdown = 0;
+    if (starGeometry) {
+        starGeometry.dispose();
+        starGeometry = null;
+    }
+    if (starGlowTexture) {
+        starGlowTexture.dispose();
+        starGlowTexture = null;
+    }
+    if (starLayer && starLayer.parent) {
+        starLayer.parent.remove(starLayer);
+    }
+    starLayer = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -365,9 +735,10 @@ function createCircleGeometry(segments) {
 }
 
 /**
- * Which way is "up" out of the disk? The physics layer decides that, not us, so
- * measure it: the axis with the smallest spread of body positions is the disk
- * normal. Defaults to +Z (the disk in the XY plane) when the cloud is not flat.
+ * Which way is "up" out of the disk? The scenario says so through
+ * `meta.diskNormal`; when it does not (or there is no disk at all) it is
+ * MEASURED: the axis with the smallest spread of body positions is the normal.
+ * Defaults to +Z, the plane the ring geometry is already built in.
  */
 function detectDiskNormalAxis(planets) {
     if (!Array.isArray(planets) || planets.length < 8) {
@@ -395,6 +766,31 @@ function detectDiskNormalAxis(planets) {
 }
 
 /**
+ * The disk normal as a unit vector: the scenario's when it publishes a usable
+ * one, the measured axis otherwise. Returns a fresh THREE.Vector3 - this is
+ * called at build time, never from the render loop.
+ */
+function resolveDiskNormal(planets, meta) {
+    const declared = meta && meta.diskNormal;
+    if (declared &&
+        typeof declared.x === 'number' && typeof declared.y === 'number' && typeof declared.z === 'number' &&
+        isFinite(declared.x) && isFinite(declared.y) && isFinite(declared.z)) {
+        const vector = new THREE.Vector3(declared.x, declared.y, declared.z);
+        if (vector.lengthSq() > 1e-12) {
+            return vector.normalize();
+        }
+    }
+    const axis = detectDiskNormalAxis(planets);
+    if (axis === 'y') {
+        return new THREE.Vector3(0, 1, 0);
+    }
+    if (axis === 'x') {
+        return new THREE.Vector3(1, 0, 0);
+    }
+    return new THREE.Vector3(0, 0, 1);
+}
+
+/**
  * Tilt the camera out of the disk plane before the opening frame.
  *
  * A protoplanetary disk viewed exactly edge-on is a line. Everything the
@@ -403,62 +799,96 @@ function detectDiskNormalAxis(planets) {
  * on a three-quarter view instead of whatever axis the camera happened to start
  * on. The user can still drop to edge-on by dragging, which is the right way to
  * inspect how thin the disk is.
+ *
+ * @param {THREE.Vector3} normal the disk normal, from the scenario or measured
+ * @param {number} [distance] AU; keeps the current distance when omitted
  */
-function orientCameraToDisk(planets) {
-    const axis = detectDiskNormalAxis(planets);
+function orientCameraToDisk(normal, distance) {
+    if (!normal || normal.lengthSq() === 0) {
+        return;
+    }
     const elevationDegrees = 32;
     const up = Math.sin(elevationDegrees * Math.PI / 180);
     const along = Math.cos(elevationDegrees * Math.PI / 180);
+
+    // An in-plane basis: any vector not parallel to the normal, orthogonalised.
+    const helper = (Math.abs(normal.z) < 0.9)
+        ? new THREE.Vector3(0, 0, 1)
+        : new THREE.Vector3(1, 0, 0);
+    const u = new THREE.Vector3().crossVectors(normal, helper);
+    if (u.lengthSq() < 1e-12) {
+        u.set(1, 0, 0);
+    }
+    u.normalize();
+    const v = new THREE.Vector3().crossVectors(normal, u).normalize();
+
     // Kept off the cardinal axes so the disk reads as a disk, not a symmetric
     // silhouette.
-    const a = along * 0.55;
-    const b = along * 0.84;
-
-    const direction = new THREE.Vector3();
-    if (axis === 'y') {
-        direction.set(a, up, b);
-    } else if (axis === 'x') {
-        direction.set(up, a, b);
-    } else {
-        direction.set(a, b, up);
-    }
+    const direction = new THREE.Vector3()
+        .addScaledVector(u, along * 0.55)
+        .addScaledVector(v, along * 0.84)
+        .addScaledVector(normal, up);
     if (direction.lengthSq() === 0) {
         return;
     }
     direction.normalize();
 
     // frameAll fits the distance along whatever direction the camera is looking
-    // from, so only the direction matters here.
-    const distance = camera.position.length() || 1;
-    camera.position.copy(direction).multiplyScalar(distance);
+    // from, so the direction is what matters here; the distance is only a hint
+    // for scenarios that publish one.
+    const length = positiveOr(distance, camera.position.length() || 1);
+    camera.position.copy(direction).multiplyScalar(length);
     camera.lookAt(0, 0, 0);
     if (cameraController && cameraController.controls) {
         cameraController.controls.target.set(0, 0, 0);
     }
 }
 
-function createGuides(planets) {
+/**
+ * Ring radii that suit the scale of what is being simulated. A 20 AU disk and a
+ * 4000 AU cluster cannot share a ladder, so the ladder is filtered to the scene
+ * and thinned to at most nine rings.
+ */
+function guideRadiiFor(extent) {
+    const ladder = [0.05, 0.1, 0.2, 0.5, 1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500,
+        1000, 2000, 3000, 5000, 10000];
+    const inner = extent / 60;
+    const outer = extent * 1.15;
+    const chosen = [];
+    for (let i = 0; i < ladder.length; i++) {
+        if (ladder[i] >= inner && ladder[i] <= outer) {
+            chosen.push(ladder[i]);
+        }
+    }
+    if (chosen.length <= 9) {
+        return chosen;
+    }
+    const stride = Math.ceil(chosen.length / 9);
+    const thinned = [];
+    for (let i = 0; i < chosen.length; i += stride) {
+        thinned.push(chosen[i]);
+    }
+    return thinned;
+}
+
+function createGuides(normal, extent) {
     const group = new THREE.Group();
     group.name = 'guides';
 
-    const geometry = createCircleGeometry(180);
-    const inner = (typeof DISK_INNER_RADIUS === 'number' && DISK_INNER_RADIUS > 0) ? DISK_INNER_RADIUS : 0.5;
-    const outer = (typeof DISK_OUTER_RADIUS === 'number' && DISK_OUTER_RADIUS > inner) ? DISK_OUTER_RADIUS : 20;
+    guideGeometry = createCircleGeometry(180);
+    guideMaterials.length = 0;
 
     // Kept deliberately dim and monochrome: these are fixed scaffolding, while
     // orbit lines are per-body coloured, so the two layers stay tellable apart.
     const ringMaterial = new THREE.LineBasicMaterial({
         color: 0x3f6ea8, transparent: true, opacity: 0.22, depthWrite: false, fog: false
     });
+    guideMaterials.push(ringMaterial);
 
-    const radii = [0.5, 1, 2, 3, 5, 10, 20, 30, 50];
+    const radii = guideRadiiFor(extent);
     for (let i = 0; i < radii.length; i++) {
-        const radius = radii[i];
-        if (radius < inner * 0.9 || radius > outer * 1.15) {
-            continue;
-        }
-        const ring = new THREE.LineLoop(geometry, ringMaterial);
-        ring.scale.setScalar(radius);
+        const ring = new THREE.LineLoop(guideGeometry, ringMaterial);
+        ring.scale.setScalar(radii[i]);
         ring.frustumCulled = false;
         ring.raycast = function () { };
         group.add(ring);
@@ -466,25 +896,40 @@ function createGuides(planets) {
 
     // The snow line is a result, not a setting: it moves with the star's
     // luminosity, so it gets its own ring and its own colour.
-    snowLineRing = new THREE.LineLoop(geometry, new THREE.LineBasicMaterial({
+    const snowMaterial = new THREE.LineBasicMaterial({
         color: 0x8fd8ff, transparent: true, opacity: 0.75, depthWrite: false, fog: false
-    }));
+    });
+    guideMaterials.push(snowMaterial);
+    snowLineRing = new THREE.LineLoop(guideGeometry, snowMaterial);
     snowLineRing.frustumCulled = false;
     snowLineRing.raycast = function () { };
     snowLineRing.visible = false;
     group.add(snowLineRing);
 
-    // RingGeometry/LineLoop circles live in the XY plane; rotate the whole group
-    // onto the plane the bodies actually occupy.
-    const axis = detectDiskNormalAxis(planets);
-    if (axis === 'y') {
-        group.rotation.x = -Math.PI / 2;
-    } else if (axis === 'x') {
-        group.rotation.y = Math.PI / 2;
-    }
+    // The circles are built in the XY plane; rotate the whole group so that its
+    // +Z lands on the disk normal.
+    group.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal);
 
     group.visible = guidesVisible;
+    lastSnowLineRadius = -1;
     return group;
+}
+
+function disposeGuides() {
+    for (let i = 0; i < guideMaterials.length; i++) {
+        guideMaterials[i].dispose();
+    }
+    guideMaterials.length = 0;
+    if (guideGeometry) {
+        guideGeometry.dispose();
+        guideGeometry = null;
+    }
+    if (guides && guides.parent) {
+        guides.parent.remove(guides);
+    }
+    guides = null;
+    snowLineRing = null;
+    lastSnowLineRadius = -1;
 }
 
 /** Keep the snow-line ring on the radius the simulation reports. */
@@ -751,7 +1196,7 @@ function computeOrbitElements(rx, ry, rz, vx, vy, vz, mu) {
     return true;
 }
 
-function createOrbitLayer() {
+function createOrbitLayer(extent) {
     orbitGroup = new THREE.Group();
     orbitGroup.name = 'orbits';
 
@@ -794,13 +1239,53 @@ function createOrbitLayer() {
     for (let i = 0; i < ORBIT_MAX_SLOTS; i++) {
         orbitSlots[i] = makeOrbitSlot();
     }
+    orbitSlotByPlanet.clear();
+    orbitActiveCount = 0;
+    orbitHighWater = 0;
+    orbitCursor = 0;
+    orbitPendingBlank = 0;
+    orbitTargetTimer = 0;
+    orbitTargetsDirty = true;
+    lastTrailSampleTime = -Infinity;
+    _orbitTouchedLow = Infinity;
+    _orbitTouchedHigh = -1;
 
-    const diskRadius = (typeof DISK_OUTER_RADIUS === 'number' && DISK_OUTER_RADIUS > 0)
-        ? DISK_OUTER_RADIUS : 20;
-    orbitMaxDrawRadius = diskRadius * ORBIT_MAX_DRAW_RADIUS_FACTOR;
+    orbitMaxDrawRadius = positiveOr(extent, 20) * ORBIT_MAX_DRAW_RADIUS_FACTOR;
 
     applyOrbitVisibility();
     return orbitGroup;
+}
+
+function disposeOrbitLayer() {
+    if (ellipseMesh) {
+        ellipseMesh.geometry.dispose();
+        ellipseMesh.material.dispose();
+    }
+    if (trailMesh) {
+        trailMesh.geometry.dispose();
+        trailMesh.material.dispose();
+    }
+    if (orbitGroup && orbitGroup.parent) {
+        orbitGroup.parent.remove(orbitGroup);
+    }
+    orbitGroup = null;
+    ellipseMesh = null;
+    trailMesh = null;
+    // the typed arrays are only reachable through the attributes above
+    ellipsePositions = null;
+    ellipseColors = null;
+    trailPositions = null;
+    trailColors = null;
+    // slots hold references to bodies: dropping them is what stops a restart
+    // from keeping the previous run's planets alive
+    orbitSlots.length = 0;
+    orbitSlotByPlanet.clear();
+    _orbitTargets.length = 0;
+    _orbitRanking.length = 0;
+    orbitActiveCount = 0;
+    orbitHighWater = 0;
+    orbitCursor = 0;
+    orbitPendingBlank = 0;
 }
 
 function applyOrbitVisibility() {
@@ -827,10 +1312,6 @@ function releaseOrbitSlot(index) {
     slot.dirty = true;
     orbitPendingBlank++;
     orbitActiveCount--;
-}
-
-function compareByMassDescending(a, b) {
-    return (b.mass || 0) - (a.mass || 0);
 }
 
 /** Add a body to the target list, skipping dead bodies and duplicates. */
@@ -872,14 +1353,13 @@ function updateOrbitTargets() {
         if (wanted > 0) {
             const ranking = _orbitRanking;
             ranking.length = 0;
-            const star = currentStar();
             for (let i = 0; i < planets.length; i++) {
                 const planet = planets[i];
                 if (!planet || planet.removed || !planet.position) {
                     continue;
                 }
-                // the star's own "orbit" is meaningless: it is the focus
-                if (planet === star) {
+                // a star's own "orbit" is meaningless: it is (near) the focus
+                if (starSet.has(planet)) {
                     continue;
                 }
                 ranking.push(planet);
@@ -962,7 +1442,7 @@ function updateOrbitTargets() {
 
 /** Push one position per tracked body into its ring buffer. */
 function sampleOrbitTrails(now) {
-    for (let i = 0; i < ORBIT_MAX_SLOTS; i++) {
+    for (let i = 0; i < orbitSlots.length; i++) {
         const slot = orbitSlots[i];
         if (!slot.active || !slot.planet || slot.planet.removed) {
             continue;
@@ -1008,22 +1488,26 @@ function blankOrbitSlot(index) {
     }
 }
 
-/** Write one body's ellipse into the shared buffer. */
-function packEllipse(index, planet, star, color) {
+/**
+ * Write one body's ellipse into the shared buffer.
+ * @param {Object} focus {x,y,z,vx,vy,vz,mass} - see focusFor()
+ */
+function packEllipse(index, planet, focus, color) {
     const positionBase = index * ORBIT_ELLIPSE_VERTICES * 3;
     const colorBase = index * ORBIT_ELLIPSE_VERTICES * 4;
 
     let ok = false;
     let sx = 0, sy = 0, sz = 0;
-    if (star && star.position && planet.position && planet.velocity) {
-        sx = star.position.x; sy = star.position.y; sz = star.position.z;
-        const sv = star.velocity || { x: 0, y: 0, z: 0 };
-        const mu = GRAVITATION_CONSTANT *
-            ((typeof star.mass === 'number' ? star.mass : 0) +
+    if (focus && planet.position && planet.velocity) {
+        sx = focus.x; sy = focus.y; sz = focus.z;
+        const gravity = positiveOr(typeof GRAVITATION_CONSTANT !== 'undefined' ? GRAVITATION_CONSTANT : 0,
+            4 * Math.PI * Math.PI);
+        const mu = gravity *
+            ((typeof focus.mass === 'number' ? focus.mass : 0) +
              (typeof planet.mass === 'number' ? planet.mass : 0));
         ok = computeOrbitElements(
             planet.position.x - sx, planet.position.y - sy, planet.position.z - sz,
-            planet.velocity.x - (sv.x || 0), planet.velocity.y - (sv.y || 0), planet.velocity.z - (sv.z || 0),
+            planet.velocity.x - focus.vx, planet.velocity.y - focus.vy, planet.velocity.z - focus.vz,
             mu
         );
     }
@@ -1150,7 +1634,6 @@ function packTrail(index, slot, now) {
  * (slots / budget) frames stale, which at 128 slots is about 5 frames.
  */
 function repackOrbitSlots(now) {
-    const star = currentStar();
     const wantEllipses = ellipseMesh.visible;
     const wantTrails = trailMesh.visible;
     let budget = ORBIT_SLOT_BUDGET;
@@ -1159,6 +1642,9 @@ function repackOrbitSlots(now) {
         const index = orbitCursor;
         orbitCursor = (orbitCursor + 1) % ORBIT_MAX_SLOTS;
         const slot = orbitSlots[index];
+        if (!slot) {
+            continue;
+        }
 
         if (!slot.active) {
             // one blanking pass after release, then it costs nothing again
@@ -1185,7 +1671,7 @@ function repackOrbitSlots(now) {
 
         slot.color = cachedColor(colorOf(planet));
         if (wantEllipses) {
-            packEllipse(index, planet, star, slot.color);
+            packEllipse(index, planet, focusFor(planet), slot.color);
         }
         if (wantTrails) {
             packTrail(index, slot, now);
@@ -1311,20 +1797,21 @@ function cycleOrbitMode() {
 // ---------------------------------------------------------------------------
 
 /**
- * Build the single InstancedMesh that draws every disk body.
+ * Build the single InstancedMesh that draws every body.
  *
  * The geometry has radius 1, so an instance's world radius is entirely carried
  * by its matrix scale.
  *
- * Lambert rather than Basic: the whole point of the scene is that there is a
- * star at the middle, and unlit spheres hide that completely. instanceColor is
- * honoured by the Lambert shader (color_vertex handles USE_INSTANCING_COLOR),
- * so the per-instance composition colours still come through.
+ * Lambert rather than Basic: the whole point of the scene is that there are
+ * stars in it, and unlit spheres hide that completely. instanceColor is honoured
+ * by the Lambert shader (color_vertex handles USE_INSTANCING_COLOR), so the
+ * per-instance composition colours still come through.
  */
 function createBodyMesh(capacity) {
-    const geometry = new THREE.DodecahedronGeometry(1, RENDER_DETAILS);
-    const material = new THREE.MeshLambertMaterial({ fog: false });
-    const mesh = new THREE.InstancedMesh(geometry, material, capacity);
+    const detail = numberOr(typeof RENDER_DETAILS !== 'undefined' ? RENDER_DETAILS : 2, 2);
+    bodyGeometry = new THREE.DodecahedronGeometry(1, detail);
+    bodyMaterial = new THREE.MeshLambertMaterial({ fog: false });
+    const mesh = new THREE.InstancedMesh(bodyGeometry, bodyMaterial, capacity);
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     // Bodies move far apart and the camera flies among them; a stale bounding
     // volume would cull instances that are actually on screen.
@@ -1335,11 +1822,36 @@ function createBodyMesh(capacity) {
     return mesh;
 }
 
+function disposeBodyMesh() {
+    if (bodyMesh) {
+        if (typeof bodyMesh.dispose === 'function') {
+            bodyMesh.dispose();          // releases the instanced attribute buffers
+        }
+        if (bodyMesh.parent) {
+            bodyMesh.parent.remove(bodyMesh);
+        }
+        bodyMesh.userData.planetIds = null;
+    }
+    if (bodyGeometry) {
+        bodyGeometry.dispose();
+        bodyGeometry = null;
+    }
+    if (bodyMaterial) {
+        bodyMaterial.dispose();
+        bodyMaterial = null;
+    }
+    bodyMesh = null;
+    planetIds.length = 0;
+    pickables.length = 0;
+}
+
 /** Push the current physics state into the instance buffers. */
 function syncInstances() {
+    if (!bodyMesh) {
+        return;
+    }
     const planets = (simulation && Array.isArray(simulation.planets)) ? simulation.planets : [];
     const capacity = bodyMesh.instanceMatrix.count;
-    const star = currentStar();
     let written = 0;
 
     for (let i = 0; i < planets.length && written < capacity; i++) {
@@ -1347,8 +1859,12 @@ function syncInstances() {
         if (!planet || planet.removed || !planet.position) {
             continue;
         }
-        // the star has its own mesh; drawing it twice would double its brightness
-        if (planet === star) {
+        // a star with its own mesh must not be drawn twice
+        if (starSet.has(planet)) {
+            continue;
+        }
+        // nor a body the detail pool is drawing at full resolution
+        if (detailBodies && detailBodies.isDetailed(planet)) {
             continue;
         }
         _position.set(planet.position.x, planet.position.y, planet.position.z);
@@ -1369,10 +1885,198 @@ function syncInstances() {
 }
 
 // ---------------------------------------------------------------------------
+// Scenario plumbing
+// ---------------------------------------------------------------------------
+//
+// EVERYTHING read out of js/scenarios.js is optional. The file may not exist,
+// may be half-written, or may publish a shape slightly different from the
+// contract: none of that is allowed to leave the user staring at a black page.
+
+/**
+ * Read one of scenarios.js's globals.
+ *
+ * `typeof X` is NOT safe here: scenarios.js may declare its registry with
+ * `const`, and a const in its temporal dead zone throws on typeof rather than
+ * reporting 'undefined'. Every read of that file goes through one of these.
+ */
+function readRegistryGlobal(name) {
+    try {
+        switch (name) {
+            case 'SCENARIOS': return (typeof SCENARIOS !== 'undefined') ? SCENARIOS : undefined;
+            case 'DEFAULT_SCENARIO_ID': return (typeof DEFAULT_SCENARIO_ID !== 'undefined') ? DEFAULT_SCENARIO_ID : undefined;
+            case 'getScenario': return (typeof getScenario !== 'undefined') ? getScenario : undefined;
+            case 'buildScenario': return (typeof buildScenario !== 'undefined') ? buildScenario : undefined;
+            case 'scenarioDefaults': return (typeof scenarioDefaults !== 'undefined') ? scenarioDefaults : undefined;
+            default: return undefined;
+        }
+    } catch (e) {
+        return undefined;            // declared but not yet initialised
+    }
+}
+
+function scenarioRegistry() {
+    const registry = readRegistryGlobal('SCENARIOS');
+    if (!Array.isArray(registry)) {
+        return [];
+    }
+    const out = [];
+    for (let i = 0; i < registry.length; i++) {
+        const scenario = registry[i];
+        if (scenario && typeof scenario === 'object' && typeof scenario.id === 'string' && scenario.id) {
+            out.push(scenario);
+        }
+    }
+    return out;
+}
+
+function scenarioById(id) {
+    if (typeof id !== 'string' || !id) {
+        return null;
+    }
+    const lookup = readRegistryGlobal('getScenario');
+    if (typeof lookup === 'function') {
+        try {
+            const found = lookup(id);
+            if (found && typeof found === 'object') {
+                return found;
+            }
+        } catch (e) { /* fall through to the registry scan */ }
+    }
+    const list = scenarioRegistry();
+    for (let i = 0; i < list.length; i++) {
+        if (list[i].id === id) {
+            return list[i];
+        }
+    }
+    return null;
+}
+
+function defaultScenarioId() {
+    const declared = readRegistryGlobal('DEFAULT_SCENARIO_ID');
+    if (typeof declared === 'string' && declared && scenarioById(declared)) {
+        return declared;
+    }
+    const list = scenarioRegistry();
+    return list.length > 0 ? list[0].id : null;
+}
+
+/** Every parameter of a scenario at its default value. Never throws. */
+function scenarioDefaultsFor(id) {
+    const declared = readRegistryGlobal('scenarioDefaults');
+    if (typeof declared === 'function') {
+        try {
+            const values = declared(id);
+            if (values && typeof values === 'object') {
+                return values;
+            }
+        } catch (e) { /* fall through */ }
+    }
+    const out = {};
+    const scenario = scenarioById(id);
+    const params = (scenario && Array.isArray(scenario.params)) ? scenario.params : [];
+    for (let i = 0; i < params.length; i++) {
+        const spec = params[i];
+        if (spec && typeof spec.key === 'string' && spec.key) {
+            out[spec.key] = spec.default;
+        }
+    }
+    return out;
+}
+
+/**
+ * Build the simulation for a scenario.
+ *
+ * Falls through several shapes of the contract, in order of preference, and
+ * throws an Error with a pt-BR message when none of them produces bodies. The
+ * caller shows that message in the picker.
+ */
+function instantiateSimulation(id, params) {
+    let bodies = null;
+    let meta = null;
+    let built = null;
+
+    const build = readRegistryGlobal('buildScenario');
+    if (id && typeof build === 'function') {
+        const result = build(id, params || {});
+        if (!result || typeof result !== 'object') {
+            throw new Error('O cenário não devolveu nenhum corpo.');
+        }
+        bodies = Array.isArray(result.bodies) ? result.bodies : null;
+        meta = (result.meta && typeof result.meta === 'object') ? result.meta : null;
+        if (!bodies || bodies.length === 0) {
+            throw new Error('O cenário não devolveu nenhum corpo.');
+        }
+        // `new Simulation(planets, meta)` is also the signature of the older
+        // constructor, which simply ignores the second argument.
+        built = new Simulation(bodies, meta);
+    } else if (id && Simulation && typeof Simulation.fromScenario === 'function') {
+        built = Simulation.fromScenario(id, params || {});
+    } else {
+        // No registry at all: the legacy constructor builds its own disk.
+        built = new Simulation();
+    }
+
+    if (!built || !Array.isArray(built.planets) || built.planets.length === 0) {
+        throw new Error('A simulação foi criada sem nenhum corpo.');
+    }
+    if (!meta && built.meta && typeof built.meta === 'object') {
+        meta = built.meta;
+    }
+    return { simulation: built, meta: meta || {} };
+}
+
+/** The scenario name for the HUD, from whichever source has one. */
+function resolveScenarioLabel(id, meta, built) {
+    if (meta && typeof meta.label === 'string' && meta.label) {
+        return meta.label;
+    }
+    const scenario = scenarioById(id || (built && built.scenarioId));
+    if (scenario && typeof scenario.name === 'string' && scenario.name) {
+        return scenario.name;
+    }
+    if (built && typeof built.scenarioId === 'string' && built.scenarioId) {
+        return built.scenarioId;
+    }
+    if (typeof id === 'string' && id) {
+        return id;
+    }
+    return 'Simulação padrão';
+}
+
+/** How big the thing being simulated is, in AU. Used for guides and clipping. */
+function measureExtent(planets, meta) {
+    let extent = 0;
+    if (Array.isArray(planets)) {
+        for (let i = 0; i < planets.length; i++) {
+            const planet = planets[i];
+            const p = planet && planet.position;
+            if (!p || !isFinite(p.x) || !isFinite(p.y) || !isFinite(p.z)) {
+                continue;
+            }
+            const d = Math.sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+            if (d > extent) {
+                extent = d;
+            }
+        }
+    }
+    const hint = meta ? positiveOr(meta.cameraDistance, 0) : 0;
+    if (hint > extent) {
+        extent = hint;
+    }
+    if (!(extent > 0)) {
+        extent = positiveOr(typeof DISK_OUTER_RADIUS !== 'undefined' ? DISK_OUTER_RADIUS : 0, 20);
+    }
+    return extent;
+}
+
+// ---------------------------------------------------------------------------
 // Application
 // ---------------------------------------------------------------------------
 
 function onWindowResize() {
+    if (!camera || !renderer) {
+        return;
+    }
     const width = window.innerWidth;
     const height = window.innerHeight;
     camera.aspect = width / height;
@@ -1392,6 +2096,9 @@ const EXTRA_KEY_BINDINGS = [
 function onExtraKeyDown(event) {
     if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) {
         return;
+    }
+    if (!running || (picker && picker.isVisible())) {
+        return;                     // the launch screen owns the keyboard
     }
     if (CameraController.isTypingTarget(event.target)) {
         return;
@@ -1442,20 +2149,22 @@ function simulatedTime() {
     return simulatedYears;
 }
 
-function start() {
+// ---------------------------------------------------------------------------
+// The stage: built once, kept for the life of the page
+// ---------------------------------------------------------------------------
+
+function initStage() {
     const width = window.innerWidth;
     const height = window.innerHeight;
 
     PERIODIC_TABLE_ELEMENTS = (new PeriodicTable()).atoms;
     resolveRenderRadiusMapping();
 
-    const diskRadius = (typeof DISK_OUTER_RADIUS === 'number' && DISK_OUTER_RADIUS > 0)
-        ? DISK_OUTER_RADIUS : 20;
-
     // A logarithmic depth buffer is what makes a near plane of 1e-3 AU coexist
     // with a far plane of 1e4 AU: without it, standing next to a 0.02 AU embryo
     // and still seeing the outer disk is not possible in one pass.
-    camera = new THREE.PerspectiveCamera(70, width / height, 0.001, diskRadius * 500);
+    camera = new THREE.PerspectiveCamera(70, width / height, 0.001, 10000);
+    camera.position.set(0, 0, 60);
 
     renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
     renderer.setPixelRatio(window.devicePixelRatio);
@@ -1463,34 +2172,187 @@ function start() {
     renderer.outputEncoding = THREE.sRGBEncoding;
 
     scene = new THREE.Scene();
-    scene.background = new THREE.Color(BACKGROUND_COLOR);
+    scene.background = new THREE.Color(
+        (typeof BACKGROUND_COLOR === 'string' && BACKGROUND_COLOR) ? BACKGROUND_COLOR : '#000');
 
     // Night sides must not be pure black or half of every body disappears.
     scene.add(new THREE.AmbientLight(0x8fa8cc, 0.5));
 
-    simulation = new Simulation();
-
-    // Headroom above PLANETS_NUMBER: fragmenting impacts can briefly raise the
-    // body count above the initial one, and an InstancedMesh cannot grow.
-    const capacity = Math.max(16, (typeof PLANETS_NUMBER === 'number' ? PLANETS_NUMBER : 800) + 64);
-    bodyMesh = createBodyMesh(capacity);
-    scene.add(bodyMesh);
-
-    scene.add(createStar());
-    guides = createGuides(simulation.planets);
-    scene.add(guides);
-    scene.add(createOrbitLayer());
-
-    pickables = [bodyMesh, starCore];
-
-    syncInstances();
-    syncStar();
-
     document.body.appendChild(renderer.domElement);
 
+    window.addEventListener('resize', onWindowResize, false);
+    window.addEventListener('keydown', onExtraKeyDown, false);
+
+    Object.assign(window, { scene, camera, renderer });
+}
+
+// ---------------------------------------------------------------------------
+// One run: build and teardown
+// ---------------------------------------------------------------------------
+
+/**
+ * Release EVERY resource buildRun() allocated. The pairs are, in order:
+ *
+ *   NavigatorUI            -> ui.dispose()
+ *   CameraController       -> cameraController.dispose()
+ *   simulation listeners   -> dropped here
+ *   InstancedMesh + geom + material -> disposeBodyMesh()
+ *   star meshes/materials/texture   -> disposeStarLayer()
+ *   guide geometry + materials      -> disposeGuides()
+ *   orbit buffers, meshes, slots    -> disposeOrbitLayer()
+ *   colour cache, world group       -> here
+ *
+ * Anything left behind shows up as growing memory and stale bodies in the body
+ * list after a few restarts, so this is deliberately exhaustive.
+ */
+function teardownRun() {
+    running = false;
+
+    if (detailBodies) {
+        try { detailBodies.dispose(); } catch (e) { /* going away anyway */ }
+        detailBodies = null;
+    }
+    if (textureLibrary) {
+        try { textureLibrary.dispose(); } catch (e) { /* idem */ }
+        textureLibrary = null;
+    }
+
+    if (ui) {
+        try { ui.dispose(); } catch (e) { /* the panel is going away anyway */ }
+        ui = null;
+    }
+    if (cameraController) {
+        try { cameraController.dispose(); } catch (e) { /* idem */ }
+        cameraController = null;
+    }
+    controls = null;
+
+    if (simulation) {
+        // Drop the callbacks we registered so the closures (and everything they
+        // capture) die with the run, even if the Simulation object is somehow
+        // kept alive elsewhere.
+        if (Array.isArray(simulation.removedListeners)) {
+            simulation.removedListeners.length = 0;
+        }
+        if (Array.isArray(simulation.spawnedListeners)) {
+            simulation.spawnedListeners.length = 0;
+        }
+    }
+    onRemovedHandler = null;
+    onSpawnedHandler = null;
+    simulation = null;
+
+    disposeOrbitLayer();
+    disposeGuides();
+    disposeStarLayer();
+    disposeBodyMesh();
+
+    if (world) {
+        if (world.parent) {
+            world.parent.remove(world);
+        }
+        world = null;
+    }
+
+    colorCache.clear();
+    starSet.clear();
+    starList.length = 0;
+    starScanCache.length = 0;
+
+    simulatedYears = 0;
+    yearsWindow = 0;
+    clockWindow = 0;
+    yearsPerSecond = 0;
+    paused = false;
+    speedMultiplier = 1;
+    renderFaults = 0;
+    activeMeta = null;
+    activeLabel = '';
+}
+
+/**
+ * Build a run. Throws (with a pt-BR message) when the scenario cannot be built;
+ * the caller shows that in the launch screen.
+ *
+ * @param {string|null} id       scenario id, null for the built-in default
+ * @param {Object|null} params   scenario parameters, may be partial
+ */
+function buildRun(id, params) {
+    teardownRun();
+
+    const created = instantiateSimulation(id, params);
+    simulation = created.simulation;
+    const meta = created.meta || {};
+
+    activeScenarioId = (typeof simulation.scenarioId === 'string' && simulation.scenarioId)
+        ? simulation.scenarioId
+        : id;
+    activeParams = params || null;
+    activeMeta = meta;
+    activeLabel = resolveScenarioLabel(id, meta, simulation);
+
+    // The timestep is a property of the scenario: a tight binary needs a far
+    // smaller one than a 20 AU disk, and reusing the disk's would visibly break
+    // it. Clamped so a malformed value cannot freeze the page.
+    const fallbackDt = positiveOr(typeof FIXED_DT !== 'undefined' ? FIXED_DT : 0, 0.0035);
+    activeDt = positiveOr(meta.suggestedDt, fallbackDt);
+    if (activeDt > 1) {
+        activeDt = 1;
+    }
+
+    // Some builds of the Simulation may not read meta themselves; setting the
+    // switches here is harmless when they did.
+    if (typeof meta.gasAccretion === 'boolean' && typeof simulation.gasAccretionEnabled === 'boolean') {
+        simulation.gasAccretionEnabled = meta.gasAccretion;
+    }
+    if (typeof meta.fusion === 'boolean' && typeof simulation.fusionEnabled === 'boolean') {
+        simulation.fusionEnabled = meta.fusion;
+    }
+
+    sceneRadius = measureExtent(simulation.planets, meta);
+    camera.far = Math.max(sceneRadius * 500, 1000);
+    camera.near = Math.max(sceneRadius * 1e-6, 1e-4);
+    camera.updateProjectionMatrix();
+
+    world = new THREE.Group();
+    world.name = 'world';
+    scene.add(world);
+
+    // Headroom above the initial body count: fragmenting impacts can briefly
+    // raise it, and an InstancedMesh cannot grow.
+    const capacity = Math.max(16, simulation.planets.length + 64);
+    bodyMesh = createBodyMesh(capacity);
+    world.add(bodyMesh);
+
+    // Most bodies are a few pixels wide, so texturing all of them is wasted. A
+    // small pool of full-detail textured spheres follows whatever the camera is
+    // actually looking at; everyone else stays a coloured instance.
+    textureLibrary = new BodyTextureLibrary();
+    detailBodies = new DetailBodyPool(world, {
+        library: textureLibrary,
+        count: 12,
+        getCamera: () => camera,
+        radiusOf: displayRadiusOf,
+        skip: (planet) => starSet.has(planet)
+    });
+
+    world.add(createStarLayer());
+
+    const normal = resolveDiskNormal(simulation.planets, meta);
+    guides = createGuides(normal, sceneRadius);
+    world.add(guides);
+
+    world.add(createOrbitLayer(sceneRadius));
+
+    syncStars();
+    updateStarField();
+    updateDetailBodies();
+    syncInstances();
+    rebuildPickables();
+
     cameraController = new CameraController(camera, renderer.domElement, {
-        getBodies: () => simulation.planets,
-        getPickables: () => pickables,
+        getBodies: () => (simulation ? simulation.planets : []),
+        getPickables: () => (detailBodies ? pickables.concat(detailBodies.pickables()) : pickables),
         scene: scene,
         onSelect: (planet) => {
             orbitTargetsDirty = true;
@@ -1513,15 +2375,15 @@ function start() {
     // the display radius explicitly so the camera stops at a distance where the
     // body actually fills the frame.
     const flyToBody = (planet, fill) => {
-        if (!planet) {
+        if (!planet || !cameraController) {
             return;
         }
         cameraController.flyTo(planet, { radius: displayRadiusOf(planet), fill: fill });
     };
 
     ui = new NavigatorUI({
-        getBodies: () => simulation.planets,
-        getStats: () => simulation.stats,
+        getBodies: () => (simulation ? simulation.planets : []),
+        getStats: () => (simulation ? simulation.stats : null),
         getCamera: () => camera,
         getOrbit: orbitOf,
         getTime: simulatedTime,
@@ -1540,65 +2402,225 @@ function start() {
         onSpeedChange: (multiplier) => { speedMultiplier = multiplier; },
         onToggleGuides: () => toggleGuides(),
         onOrbitModeChange: (mode) => setOrbitMode(mode),
-        onOrbitScopeChange: (scope) => setOrbitScope(scope)
+        onOrbitScopeChange: (scope) => setOrbitScope(scope),
+        onChangeScenario: () => openPicker()
     });
     ui.setGuidesVisible(guidesVisible);
     ui.setOrbitMode(orbitMode);
     ui.setOrbitScope(orbitScope);
+    ui.setSpeed(1, false);
+    ui.setPaused(false);
+    ui.setScenario(activeLabel, activeScenarioId);
 
+    onRemovedHandler = function (planet) {
+        if (!cameraController || !ui) {
+            return;
+        }
+        const watched = cameraController.getFollowed() || cameraController.getSelected();
+        if (watched !== planet) {
+            return;
+        }
+        const label = (planet && typeof planet.classLabel === 'string' && planet.classLabel)
+            ? planet.classLabel
+            : 'Corpo';
+        const id = (planet && planet.id !== undefined) ? ' #' + planet.id : '';
+        ui.notify(label + id + ' acretado por outro corpo');
+    };
     if (typeof simulation.onPlanetRemoved === 'function') {
-        simulation.onPlanetRemoved((planet) => {
-            const watched = cameraController.getFollowed() || cameraController.getSelected();
-            if (watched !== planet) {
-                return;
-            }
-            const label = (planet && typeof planet.classLabel === 'string' && planet.classLabel)
-                ? planet.classLabel
-                : 'Corpo';
-            const id = (planet && planet.id !== undefined) ? ' #' + planet.id : '';
-            ui.notify(label + id + ' acretado por outro corpo');
-        });
+        simulation.onPlanetRemoved(onRemovedHandler);
+    }
+    onSpawnedHandler = function () {
+        orbitTargetsDirty = true;
+    };
+    if (typeof simulation.onPlanetSpawned === 'function') {
+        simulation.onPlanetSpawned(onSpawnedHandler);
     }
 
-    window.addEventListener('resize', onWindowResize, false);
-    window.addEventListener('keydown', onExtraKeyDown, false);
-    Object.assign(window, { scene, simulation, camera, cameraController, ui });
+    Object.assign(window, { simulation, cameraController, ui });
 
-    // Frame the whole disk rather than sitting at the origin inside the star,
-    // and look at it from above the plane first - see orientCameraToDisk.
-    orientCameraToDisk(simulation.planets);
-    cameraController.frameAll({ duration: 0 });
+    // Frame the whole system rather than sitting at the origin inside a star,
+    // and look at it from above the plane first - see orientCameraToDisk. When
+    // the scenario suggests an opening distance, that is used verbatim;
+    // otherwise the bounding sphere decides.
+    // Start every run from the same place, whatever the previous one left the
+    // camera doing: a restart that opened from the inside of a body would be
+    // indistinguishable from a broken build.
+    const suggestedDistance = positiveOr(meta.cameraDistance, 0);
+    if (camera.up && camera.up.set) {
+        camera.up.set(0, 1, 0);
+    }
+    camera.position.set(0, 0, Math.max(sceneRadius * 2.2, 1));
+    orientCameraToDisk(normal, suggestedDistance > 0 ? suggestedDistance : undefined);
+    if (suggestedDistance > 0) {
+        cameraController.controls.target.set(0, 0, 0);
+        cameraController.controls.saveState();
+    } else {
+        cameraController.frameAll({ duration: 0 });
+    }
+
+    if (typeof meta.notes === 'string' && meta.notes) {
+        ui.notify(meta.notes);
+    }
+
+    running = true;
+}
+
+// ---------------------------------------------------------------------------
+// The launch screen
+// ---------------------------------------------------------------------------
+
+function ensurePicker() {
+    if (picker) {
+        return picker;
+    }
+    picker = new ScenarioPicker({
+        getScenarios: scenarioRegistry,
+        getDefaultId: defaultScenarioId,
+        getDefaults: scenarioDefaultsFor,
+        onStart: startScenario,
+        onCancel: () => {
+            // only offered while a run exists behind the launch screen
+            if (running) {
+                closePicker();
+            }
+        }
+    });
+    return picker;
+}
+
+/** Called by the picker's "Iniciar simulação" button. */
+function startScenario(id, params) {
+    const screen = ensurePicker();
+    if (!id) {
+        id = defaultScenarioId();
+    }
+    screen.setError('');
+    try {
+        buildRun(id, params);
+    } catch (error) {
+        const detail = (error && error.message) ? String(error.message) : '';
+        screen.setError('Não foi possível montar este cenário. ' + detail);
+        // Leave whatever was there before torn down but do NOT leave a blank
+        // page: the launch screen stays up with a way out.
+        screen.show({ allowCancel: false });
+        return;
+    }
+    screen.hide();
+    if (ui && activeLabel) {
+        ui.notify('Cenário: ' + activeLabel);
+    }
+}
+
+let pausedBeforePicker = false;
+
+/** "Trocar cenário": back to the launch screen without reloading the page. */
+function openPicker() {
+    const screen = ensurePicker();
+    pausedBeforePicker = paused;
+    paused = true;
+    if (ui) {
+        ui.setPaused(true);
+    }
+    // The controller listens on window: leave it enabled and Tab, Space and the
+    // camera shortcuts would fire while the user is filling in the form.
+    if (cameraController) {
+        cameraController.setEnabled(false);
+    }
+    screen.show({
+        scenarioId: activeScenarioId,
+        allowCancel: running,
+        keptParameters: true
+    });
+}
+
+/** Dismiss the launch screen and hand the running simulation back. */
+function closePicker() {
+    if (picker) {
+        picker.hide();
+    }
+    if (cameraController) {
+        cameraController.setEnabled(true);
+    }
+    paused = pausedBeforePicker;
+    if (ui) {
+        ui.setPaused(paused);
+    }
+}
+
+function boot() {
+    try {
+        initStage();
+    } catch (error) {
+        showFatalError(error);
+        return;
+    }
+
+    const screen = ensurePicker();
+    if (scenarioRegistry().length === 0) {
+        screen.setError(
+            'A lista de cenários ainda não está disponível. ' +
+            'Você pode iniciar a simulação padrão e escolher um cenário depois.');
+    }
+    screen.show({ allowCancel: false });
 
     let lastTime = performance.now();
     let accumulator = 0;
 
     function animate(now) {
+        // scheduled FIRST, so even a thrown frame cannot kill the page
         requestAnimationFrame(animate);
 
         let frameTime = (now - lastTime) / 1000;
         lastTime = now;
-        if (frameTime > MAX_FRAME_TIME) {
-            frameTime = MAX_FRAME_TIME;
+        const maxFrameTime = positiveOr(typeof MAX_FRAME_TIME !== 'undefined' ? MAX_FRAME_TIME : 0, 0.25);
+        if (!(frameTime > 0)) {
+            frameTime = 0;
+        }
+        if (frameTime > maxFrameTime) {
+            frameTime = maxFrameTime;
         }
 
+        try {
+            if (running && simulation) {
+                stepAndDraw(frameTime);
+            }
+            renderer.render(scene, camera);
+        } catch (error) {
+            renderFaults++;
+            if (renderFaults === 1) {
+                if (ui) {
+                    ui.notify('Erro ao desenhar o quadro; a simulação foi pausada.');
+                    ui.setPaused(true);
+                }
+                paused = true;
+                if (typeof console !== 'undefined' && console.error) {
+                    console.error(error);
+                }
+            }
+        }
+    }
+
+    function stepAndDraw(frameTime) {
+        frameCounter++;
         let steppedYears = 0;
 
         if (!paused) {
-            // FIXED_DT is in YEARS, frameTime is in seconds: at 1x, one real
-            // second advances the disk by one year.
+            // activeDt is in YEARS, frameTime is in seconds: at 1x, one real
+            // second advances the system by 1/activeDt steps.
             accumulator += frameTime * speedMultiplier;
 
             // MAX_STEPS_PER_FRAME is budgeted for 1x. Scaling it with the
             // multiplier is what makes the 2x and 4x buttons actually do
             // something instead of silently discarding the backlog.
+            const budget = positiveOr(typeof MAX_STEPS_PER_FRAME !== 'undefined' ? MAX_STEPS_PER_FRAME : 0, 8);
             const maxSteps = Math.min(48, Math.max(1,
-                Math.ceil(MAX_STEPS_PER_FRAME * Math.max(1, speedMultiplier))));
+                Math.ceil(budget * Math.max(1, speedMultiplier))));
 
             let steps = 0;
-            while (accumulator >= FIXED_DT && steps < maxSteps) {
-                simulation.step(FIXED_DT);
-                accumulator -= FIXED_DT;
-                steppedYears += FIXED_DT;
+            while (accumulator >= activeDt && steps < maxSteps) {
+                simulation.step(activeDt);
+                accumulator -= activeDt;
+                steppedYears += activeDt;
                 steps++;
             }
             // Could not keep up: drop the backlog rather than accumulate a debt
@@ -1617,16 +2639,48 @@ function start() {
             clockWindow = 0;
         }
 
+        syncStars();
+        updateStarField();
+        updateDetailBodies();
         syncInstances();
-        syncStar();
         updateOrbits(frameTime, simulatedTime());
         cameraController.update(frameTime);
         ui.update(frameTime);
         updateSnowLine(ui.snowLineRadius());
-        renderer.render(scene, camera);
     }
+
+    // The accumulator must not swallow the time spent on the launch screen.
+    function resetClock() {
+        lastTime = performance.now();
+        accumulator = 0;
+    }
+    window.addEventListener('focus', resetClock, false);
 
     requestAnimationFrame(animate);
 }
 
-window.onload = start;
+/**
+ * Last resort: the stage itself could not be built (no WebGL, for instance).
+ * Anything is better than a black page with nothing on it.
+ */
+function showFatalError(error) {
+    const box = document.createElement('div');
+    box.className = 'nv-fatal';
+    const title = document.createElement('h1');
+    title.textContent = 'Não foi possível iniciar a simulação';
+    const text = document.createElement('p');
+    text.textContent = 'O navegador não conseguiu criar a cena 3D. ' +
+        'Verifique se o WebGL está habilitado e recarregue a página.';
+    const detail = document.createElement('p');
+    detail.className = 'nv-fatal__detail';
+    detail.textContent = (error && error.message) ? String(error.message) : '';
+    box.appendChild(title);
+    box.appendChild(text);
+    box.appendChild(detail);
+    document.body.appendChild(box);
+    if (typeof console !== 'undefined' && console.error) {
+        console.error(error);
+    }
+}
+
+window.onload = boot;

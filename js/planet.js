@@ -31,9 +31,22 @@ class Planet{
         this.previousPosition = position.copy()
         this.mass = isFinite(mass) && mass > 0 ? mass : 0
         this.composition = composition || new Composition()
-        // The central star is never destroyed by accretion and never enters the
-        // Barnes-Hut tree; the simulation sets this flag on the body it creates.
+        // Star bookkeeping, maintained by Simulation.refreshStars().
+        //
+        // `isStar` marks a body that is summed EXACTLY, body by body, outside
+        // the Barnes-Hut tree. Scenarios set it on the stars they create; the
+        // simulation also sets it on anything that grows into CLASS_STAR. There
+        // may be one of these or fifty, and none of them is ever a tree body.
+        //
+        // `isCentralStar` is the single dominant one - the heaviest star in the
+        // system. It is what `simulation.star` points at, what the HUD reads,
+        // and the body that always wins an accretion against a non-star.
+        this.isStar = false
         this.isCentralStar = false
+        // Position in Simulation.stars, or -1. Kept on the body so the force
+        // solver can classify 800 planets in one linear pass per step instead
+        // of searching the star list for each of them.
+        this.starIndex = -1
         this.removed = false
         // Derived quantities, all filled by refreshStructure().
         this.radius = 0

@@ -81,6 +81,7 @@ class NavigatorUI {
      *   onToggleGuides {Function} () => void
      *   onOrbitModeChange {Function} ('none'|'ellipses'|'trails'|'both') => void
      *   onOrbitScopeChange {Function} ('selected'|'top12'|'top48'|'all') => void
+     *   onChangeScenario {Function} () => void                back to the launch screen
      *   maxRows        {number}   default 60
      *   refreshInterval{number}   seconds, default 0.25
      */
@@ -108,6 +109,7 @@ class NavigatorUI {
         this.onToggleGuides = options.onToggleGuides || null;
         this.onOrbitModeChange = options.onOrbitModeChange || null;
         this.onOrbitScopeChange = options.onOrbitScopeChange || null;
+        this.onChangeScenario = options.onChangeScenario || null;
 
         this.maxRows = options.maxRows || 60;
         this.refreshInterval = options.refreshInterval || 0.25;
@@ -126,6 +128,8 @@ class NavigatorUI {
         this.guidesOn = true;
         this.orbitMode = 'ellipses';
         this.orbitScope = 'top12';
+        this.scenarioLabel = null;
+        this.scenarioId = null;
 
         // throttling / fps
         this._accumulator = 0;
@@ -286,6 +290,7 @@ class NavigatorUI {
         }
 
         panel.nvBody = body;
+        panel.nvTitle = title;
         return panel;
     }
 
@@ -337,6 +342,7 @@ class NavigatorUI {
 
         const topGrid = document.createElement('dl');
         topGrid.className = 'nv-stats';
+        this._statRow(topGrid, this.hudFields, 'scenario', 'Cenário');
         this._statRow(topGrid, this.hudFields, 'time', 'Tempo simulado', true);
         this._statRow(topGrid, this.hudFields, 'rate', 'Ritmo');
         this._statRow(topGrid, this.hudFields, 'count', 'Corpos');
@@ -821,6 +827,18 @@ class NavigatorUI {
         this.guidesButton = guides;
         extras.appendChild(guides);
 
+        const swap = document.createElement('button');
+        swap.type = 'button';
+        swap.className = 'nv-chip';
+        swap.textContent = 'Trocar cenário';
+        swap.title = 'Escolher outro cenário sem recarregar a página';
+        swap.addEventListener('click', function () {
+            if (self.onChangeScenario) { self.onChangeScenario(); }
+            self._blur(swap);
+        });
+        this.scenarioButton = swap;
+        extras.appendChild(swap);
+
         const help = document.createElement('button');
         help.type = 'button';
         help.className = 'nv-chip nv-chip--action';
@@ -1006,6 +1024,27 @@ class NavigatorUI {
         this.setPaused(!this.paused);
         if (this.onPause) {
             this.onPause(this.paused);
+        }
+        return this;
+    }
+
+    /**
+     * Name the scenario that is running, in the HUD header and in its own row.
+     * Both arguments are optional: whatever is missing simply is not shown.
+     */
+    setScenario(label, id) {
+        const name = (typeof label === 'string' && label) ? label : null;
+        const identifier = (typeof id === 'string' && id) ? id : null;
+        this.scenarioLabel = name;
+        this.scenarioId = identifier;
+        if (this.hudPanel && this.hudPanel.nvTitle) {
+            this.hudPanel.nvTitle.textContent = name || 'Simulação';
+        }
+        if (this.hudFields && this.hudFields.scenario) {
+            NavigatorUI._writeStat(this.hudFields.scenario, name || identifier);
+            if (identifier) {
+                this.hudFields.scenario.dd.title = identifier;
+            }
         }
         return this;
     }
@@ -1555,6 +1594,16 @@ class NavigatorUI {
 
         write(fields.fps, this._fps ? this._fps.toFixed(0) : '—');
         write(fields.mode, NavigatorUI.MODE_LABELS[this.mode] || this.mode);
+
+        // The scenario is set once per run by setScenario(); stats.scenarioId
+        // only overrides it when the physics layer disagrees with what we were
+        // told, which happens when a build falls back to another scenario.
+        const publishedId = (stats && typeof stats.scenarioId === 'string' && stats.scenarioId)
+            ? stats.scenarioId
+            : null;
+        if (publishedId && publishedId !== this.scenarioId && !this.scenarioLabel) {
+            this.setScenario(publishedId, publishedId);
+        }
     }
 
     _refreshInspector() {
@@ -2052,5 +2101,969 @@ class NavigatorUI {
             value = value.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
         }
         return value.trim();
+    }
+}
+
+/**
+ * ScenarioPicker
+ *
+ * The launch screen: an overlay shown BEFORE the simulation starts, and again
+ * whenever the user asks for a different scenario.
+ *
+ * IT KNOWS NOTHING ABOUT ANY PARTICULAR SCENARIO. The cards come from the
+ * SCENARIOS registry and every control is generated from the `params` array of
+ * the selected descriptor, following the ParamSpec schema (`int`, `float`,
+ * `bool`, `choice`). Adding a scenario, or a parameter to one, changes nothing
+ * here.
+ *
+ * DEFENSIVE BY DESIGN. The registry may be missing, empty or malformed, and
+ * buildScenario may throw: every one of those paths ends in a readable pt-BR
+ * message plus a way to start something, never in a blank page.
+ *
+ * No modules, no build step: this declares a global class.
+ * All user-facing strings are pt-BR.
+ */
+
+/** pt-BR names for the contract's categories; anything else is shown verbatim. */
+const NV_CATEGORY_LABELS = {
+    sistema: 'Sistema planetário',
+    multiplo: 'Múltiplas estrelas',
+    colisao: 'Colisão',
+    aglomerado: 'Aglomerado',
+    custom: 'Personalizado'
+};
+
+class ScenarioPicker {
+
+    /**
+     * @param {Object} options
+     *   mount        {HTMLElement}                     default document.body
+     *   getScenarios {Function} () => descriptor[]
+     *   getDefaultId {Function} () => string|null
+     *   getDefaults  {Function} (id) => {key: value}
+     *   onStart      {Function} (id|null, params) => void
+     *   onCancel     {Function} () => void             "Voltar à simulação"
+     */
+    constructor(options) {
+        options = options || {};
+        this.options = options;
+        this.mount = options.mount || document.body;
+
+        this.getScenarios = typeof options.getScenarios === 'function'
+            ? options.getScenarios : function () { return []; };
+        this.getDefaultId = typeof options.getDefaultId === 'function'
+            ? options.getDefaultId : function () { return null; };
+        this.getDefaults = typeof options.getDefaults === 'function'
+            ? options.getDefaults : function () { return {}; };
+        this.onStart = options.onStart || null;
+        this.onCancel = options.onCancel || null;
+
+        // per-scenario parameter values, kept across show/hide so a "Trocar
+        // cenário" does not silently throw away what the user typed
+        this.values = Object.create(null);
+        this.scenarios = [];
+        this.selectedId = null;
+        this.category = 'all';
+        this.visible = false;
+        this.errorText = '';
+        this.cards = [];
+        this.controls = [];
+        this.allowCancel = false;
+
+        this._onKeyDown = this._handleKeyDown.bind(this);
+        this._build();
+    }
+
+    // =======================================================================
+    // DOM
+    // =======================================================================
+
+    _build() {
+        const self = this;
+
+        const root = document.createElement('div');
+        root.className = 'nv-launch';
+        root.setAttribute('role', 'dialog');
+        root.setAttribute('aria-modal', 'true');
+        root.setAttribute('aria-label', 'Escolha do cenário');
+
+        const dialog = document.createElement('div');
+        dialog.className = 'nv-launch__dialog';
+
+        // --- header --------------------------------------------------------
+        const header = document.createElement('header');
+        header.className = 'nv-launch__header';
+
+        const title = document.createElement('h1');
+        title.className = 'nv-launch__title';
+        title.textContent = 'Simulação do Universo';
+
+        const subtitle = document.createElement('p');
+        subtitle.className = 'nv-launch__subtitle';
+        subtitle.textContent = 'Escolha o que simular e ajuste os parâmetros antes de começar.';
+
+        header.appendChild(title);
+        header.appendChild(subtitle);
+        dialog.appendChild(header);
+
+        // --- body: cards on the left, parameters on the right --------------
+        const body = document.createElement('div');
+        body.className = 'nv-launch__body';
+
+        const left = document.createElement('div');
+        left.className = 'nv-launch__left';
+
+        const filters = document.createElement('div');
+        filters.className = 'nv-launch__filters';
+        filters.setAttribute('role', 'group');
+        filters.setAttribute('aria-label', 'Filtrar por categoria');
+        this.filterRow = filters;
+        left.appendChild(filters);
+
+        const cards = document.createElement('div');
+        cards.className = 'nv-launch__cards';
+        cards.setAttribute('role', 'radiogroup');
+        cards.setAttribute('aria-label', 'Cenários disponíveis');
+        cards.addEventListener('keydown', function (event) {
+            self._handleCardKey(event);
+        });
+        this.cardList = cards;
+        left.appendChild(cards);
+
+        const right = document.createElement('div');
+        right.className = 'nv-launch__right';
+
+        const detailName = document.createElement('h2');
+        detailName.className = 'nv-launch__name';
+        detailName.textContent = 'Nenhum cenário selecionado';
+        this.detailName = detailName;
+
+        const detailBadge = document.createElement('span');
+        detailBadge.className = 'nv-launch__category';
+        this.detailBadge = detailBadge;
+
+        const detailHead = document.createElement('div');
+        detailHead.className = 'nv-launch__detailhead';
+        detailHead.appendChild(detailName);
+        detailHead.appendChild(detailBadge);
+
+        const detailText = document.createElement('p');
+        detailText.className = 'nv-launch__description';
+        this.detailText = detailText;
+
+        const params = document.createElement('div');
+        params.className = 'nv-params';
+        this.paramsHolder = params;
+
+        const kept = document.createElement('p');
+        kept.className = 'nv-launch__kept nv-hidden';
+        kept.textContent = 'Os parâmetros da última execução foram mantidos. ' +
+            'Use "Restaurar padrões" para voltar aos valores originais.';
+        this.keptNotice = kept;
+
+        right.appendChild(detailHead);
+        right.appendChild(detailText);
+        right.appendChild(kept);
+        right.appendChild(params);
+
+        body.appendChild(left);
+        body.appendChild(right);
+        dialog.appendChild(body);
+
+        // --- error banner ---------------------------------------------------
+        const error = document.createElement('div');
+        error.className = 'nv-launch__error nv-hidden';
+        error.setAttribute('role', 'alert');
+
+        const errorText = document.createElement('p');
+        error.appendChild(errorText);
+        this.errorBox = error;
+        this.errorMessage = errorText;
+
+        const fallback = document.createElement('button');
+        fallback.type = 'button';
+        fallback.className = 'nv-button';
+        fallback.textContent = 'Iniciar a simulação padrão';
+        fallback.addEventListener('click', function () {
+            self._emitStart(null, null);
+        });
+        this.fallbackButton = fallback;
+        error.appendChild(fallback);
+        dialog.appendChild(error);
+
+        // --- footer ---------------------------------------------------------
+        const footer = document.createElement('footer');
+        footer.className = 'nv-launch__footer';
+
+        const reset = document.createElement('button');
+        reset.type = 'button';
+        reset.className = 'nv-button';
+        reset.textContent = 'Restaurar padrões';
+        reset.title = 'Voltar todos os parâmetros deste cenário aos valores originais';
+        reset.addEventListener('click', function () {
+            self.resetDefaults();
+        });
+        this.resetButton = reset;
+
+        const cancel = document.createElement('button');
+        cancel.type = 'button';
+        cancel.className = 'nv-button nv-hidden';
+        cancel.textContent = 'Voltar à simulação';
+        cancel.addEventListener('click', function () {
+            if (self.onCancel) { self.onCancel(); }
+        });
+        this.cancelButton = cancel;
+
+        const start = document.createElement('button');
+        start.type = 'button';
+        start.className = 'nv-button nv-button--primary nv-launch__start';
+        start.textContent = 'Iniciar simulação';
+        start.addEventListener('click', function () {
+            self.start();
+        });
+        this.startButton = start;
+
+        const spacer = document.createElement('span');
+        spacer.className = 'nv-launch__spacer';
+
+        footer.appendChild(reset);
+        footer.appendChild(spacer);
+        footer.appendChild(cancel);
+        footer.appendChild(start);
+        dialog.appendChild(footer);
+
+        root.appendChild(dialog);
+        this.root = root;
+        this.mount.appendChild(root);
+    }
+
+    // =======================================================================
+    // public API
+    // =======================================================================
+
+    isVisible() {
+        return this.visible;
+    }
+
+    /**
+     * @param {Object} [options]
+     *   scenarioId     {string}  pre-select this scenario
+     *   allowCancel    {boolean} show "Voltar à simulação"
+     *   keptParameters {boolean} explain that the previous values were kept
+     */
+    show(options) {
+        options = options || {};
+        this.allowCancel = !!options.allowCancel;
+        this.cancelButton.classList.toggle('nv-hidden', !this.allowCancel);
+        this.keptNotice.classList.toggle('nv-hidden', !options.keptParameters);
+
+        this._readRegistry();
+        this._renderFilters();
+        this._renderCards();
+
+        let wanted = (typeof options.scenarioId === 'string' && options.scenarioId)
+            ? options.scenarioId
+            : this.selectedId;
+        if (!this._find(wanted)) {
+            wanted = null;
+        }
+        if (!wanted) {
+            let fallback = null;
+            try { fallback = this.getDefaultId(); } catch (e) { fallback = null; }
+            wanted = (fallback && this._find(fallback))
+                ? fallback
+                : (this.scenarios.length > 0 ? this.scenarios[0].id : null);
+        }
+        this.select(wanted);
+
+        this.visible = true;
+        this.root.classList.add('nv-launch--on');
+        // removed first: show() may be called twice in a row (a failed build
+        // re-shows the screen) and the listener must not stack up.
+        document.removeEventListener('keydown', this._onKeyDown, true);
+        document.addEventListener('keydown', this._onKeyDown, true);
+
+        // focus something useful, but never trap focus inside the dialog
+        const focusTarget = this._selectedCard() || this.startButton;
+        if (focusTarget && focusTarget.focus) {
+            try { focusTarget.focus(); } catch (e) { /* ignore */ }
+        }
+        return this;
+    }
+
+    hide() {
+        this.visible = false;
+        this.root.classList.remove('nv-launch--on');
+        document.removeEventListener('keydown', this._onKeyDown, true);
+        return this;
+    }
+
+    /** An empty message clears the banner. */
+    setError(message) {
+        this.errorText = (typeof message === 'string') ? message : '';
+        const empty = !this.errorText;
+        this.errorMessage.textContent = this.errorText;
+        this.errorBox.classList.toggle('nv-hidden', empty);
+        return this;
+    }
+
+    dispose() {
+        document.removeEventListener('keydown', this._onKeyDown, true);
+        if (this.root && this.root.parentNode) {
+            this.root.parentNode.removeChild(this.root);
+        }
+        this.cards.length = 0;
+        this.controls.length = 0;
+        return this;
+    }
+
+    /** Select a scenario by id and regenerate its parameter controls. */
+    select(id) {
+        const scenario = this._find(id);
+        this.selectedId = scenario ? scenario.id : null;
+
+        for (let i = 0; i < this.cards.length; i++) {
+            const card = this.cards[i];
+            const active = !!scenario && card.dataset.scenario === scenario.id;
+            card.classList.toggle('nv-scenario--active', active);
+            card.setAttribute('aria-checked', active ? 'true' : 'false');
+        }
+
+        if (!scenario) {
+            this.detailName.textContent = 'Nenhum cenário disponível';
+            this.detailBadge.textContent = '';
+            this.detailBadge.classList.add('nv-hidden');
+            this.detailText.textContent =
+                'Escolher um cenário exige a lista de cenários, que não foi carregada. ' +
+                'Você ainda pode iniciar a simulação padrão.';
+            this._clearParams();
+            this.startButton.disabled = true;
+            this.resetButton.disabled = true;
+            if (!this.errorText) {
+                this.setError('A lista de cenários não foi carregada.');
+            }
+            return this;
+        }
+
+        this.startButton.disabled = false;
+        this.detailName.textContent = ScenarioPicker.textOf(scenario.name, scenario.id);
+        const category = ScenarioPicker.categoryLabel(scenario.category);
+        this.detailBadge.textContent = category;
+        this.detailBadge.classList.toggle('nv-hidden', !category);
+        if (scenario.category) {
+            this.detailBadge.dataset.category = String(scenario.category);
+        }
+        this.detailText.textContent = ScenarioPicker.textOf(scenario.description, '');
+        this._renderParams(scenario);
+        return this;
+    }
+
+    /** Put every parameter of the selected scenario back to its default. */
+    resetDefaults() {
+        if (!this.selectedId) {
+            return this;
+        }
+        delete this.values[this.selectedId];
+        this.keptNotice.classList.add('nv-hidden');
+        const scenario = this._find(this.selectedId);
+        if (scenario) {
+            this._renderParams(scenario);
+        }
+        return this;
+    }
+
+    /** The parameters as they would be handed to buildScenario(). */
+    collectParams() {
+        const scenario = this._find(this.selectedId);
+        if (!scenario) {
+            return {};
+        }
+        const specs = ScenarioPicker.specsOf(scenario);
+        const stored = this._valuesFor(scenario);
+        const out = {};
+        for (let i = 0; i < specs.length; i++) {
+            const spec = specs[i];
+            out[spec.key] = ScenarioPicker.clampValue(spec, stored[spec.key]);
+        }
+        return out;
+    }
+
+    start() {
+        if (!this.selectedId) {
+            this._emitStart(null, null);
+            return this;
+        }
+        this._emitStart(this.selectedId, this.collectParams());
+        return this;
+    }
+
+    // =======================================================================
+    // internals
+    // =======================================================================
+
+    _emitStart(id, params) {
+        if (this.onStart) {
+            this.onStart(id, params);
+        }
+    }
+
+    _readRegistry() {
+        let list;
+        try { list = this.getScenarios(); } catch (e) { list = null; }
+        this.scenarios = Array.isArray(list) ? list.filter(function (scenario) {
+            return scenario && typeof scenario === 'object' &&
+                typeof scenario.id === 'string' && scenario.id;
+        }) : [];
+        return this.scenarios;
+    }
+
+    _find(id) {
+        if (typeof id !== 'string' || !id) {
+            return null;
+        }
+        for (let i = 0; i < this.scenarios.length; i++) {
+            if (this.scenarios[i].id === id) {
+                return this.scenarios[i];
+            }
+        }
+        return null;
+    }
+
+    _selectedCard() {
+        for (let i = 0; i < this.cards.length; i++) {
+            if (this.cards[i].dataset.scenario === this.selectedId) {
+                return this.cards[i];
+            }
+        }
+        return null;
+    }
+
+    _renderFilters() {
+        const self = this;
+        const row = this.filterRow;
+        while (row.firstChild) {
+            row.removeChild(row.firstChild);
+        }
+        const seen = [];
+        for (let i = 0; i < this.scenarios.length; i++) {
+            const category = this.scenarios[i].category;
+            if (typeof category === 'string' && category && seen.indexOf(category) === -1) {
+                seen.push(category);
+            }
+        }
+        if (seen.length < 2) {
+            this.category = 'all';
+            return;                       // one category: a filter would be noise
+        }
+        if (this.category !== 'all' && seen.indexOf(this.category) === -1) {
+            this.category = 'all';
+        }
+        const entries = [['all', 'Todos']];
+        for (let i = 0; i < seen.length; i++) {
+            entries.push([seen[i], ScenarioPicker.categoryLabel(seen[i])]);
+        }
+        for (let i = 0; i < entries.length; i++) {
+            const key = entries[i][0];
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'nv-chip nv-chip--mini';
+            button.textContent = entries[i][1];
+            button.classList.toggle('nv-chip--active', key === this.category);
+            button.addEventListener('click', function () {
+                self.category = key;
+                self._renderFilters();
+                self._renderCards();
+                self.select(self.selectedId);
+                if (button.blur) { button.blur(); }
+            });
+            row.appendChild(button);
+        }
+    }
+
+    _renderCards() {
+        const self = this;
+        const holder = this.cardList;
+        while (holder.firstChild) {
+            holder.removeChild(holder.firstChild);
+        }
+        this.cards.length = 0;
+
+        if (this.scenarios.length === 0) {
+            const empty = document.createElement('p');
+            empty.className = 'nv-launch__empty';
+            empty.textContent = 'Nenhum cenário foi carregado.';
+            holder.appendChild(empty);
+            return;
+        }
+
+        for (let i = 0; i < this.scenarios.length; i++) {
+            const scenario = this.scenarios[i];
+            if (this.category !== 'all' && scenario.category !== this.category) {
+                continue;
+            }
+            const card = document.createElement('button');
+            card.type = 'button';
+            card.className = 'nv-scenario';
+            card.setAttribute('role', 'radio');
+            card.setAttribute('aria-checked', 'false');
+            card.dataset.scenario = scenario.id;
+
+            const head = document.createElement('span');
+            head.className = 'nv-scenario__head';
+
+            const name = document.createElement('span');
+            name.className = 'nv-scenario__name';
+            name.textContent = ScenarioPicker.textOf(scenario.name, scenario.id);
+
+            const badge = document.createElement('span');
+            badge.className = 'nv-scenario__category';
+            const category = ScenarioPicker.categoryLabel(scenario.category);
+            badge.textContent = category;
+            if (scenario.category) {
+                badge.dataset.category = String(scenario.category);
+            }
+            badge.classList.toggle('nv-hidden', !category);
+
+            head.appendChild(name);
+            head.appendChild(badge);
+
+            const description = document.createElement('span');
+            description.className = 'nv-scenario__description';
+            description.textContent = ScenarioPicker.textOf(scenario.description, '');
+
+            card.appendChild(head);
+            card.appendChild(description);
+            card.addEventListener('click', function () {
+                self.select(scenario.id);
+            });
+            holder.appendChild(card);
+            this.cards.push(card);
+        }
+
+        if (this.cards.length === 0) {
+            const empty = document.createElement('p');
+            empty.className = 'nv-launch__empty';
+            empty.textContent = 'Nenhum cenário nesta categoria.';
+            holder.appendChild(empty);
+        }
+    }
+
+    _clearParams() {
+        const holder = this.paramsHolder;
+        while (holder.firstChild) {
+            holder.removeChild(holder.firstChild);
+        }
+        this.controls.length = 0;
+    }
+
+    /** The stored values of a scenario, seeded from its defaults on first use. */
+    _valuesFor(scenario) {
+        let values = this.values[scenario.id];
+        if (!values) {
+            values = Object.create(null);
+            let defaults = null;
+            try { defaults = this.getDefaults(scenario.id); } catch (e) { defaults = null; }
+            const specs = ScenarioPicker.specsOf(scenario);
+            for (let i = 0; i < specs.length; i++) {
+                const spec = specs[i];
+                const seed = (defaults && defaults[spec.key] !== undefined)
+                    ? defaults[spec.key]
+                    : spec.default;
+                values[spec.key] = ScenarioPicker.clampValue(spec, seed);
+            }
+            this.values[scenario.id] = values;
+        }
+        return values;
+    }
+
+    /**
+     * Generate the controls for a scenario, purely from its ParamSpec array.
+     * Nothing here is specific to any scenario.
+     */
+    _renderParams(scenario) {
+        this._clearParams();
+        const specs = ScenarioPicker.specsOf(scenario);
+        this.resetButton.disabled = specs.length === 0;
+
+        if (specs.length === 0) {
+            const none = document.createElement('p');
+            none.className = 'nv-params__empty';
+            none.textContent = 'Este cenário não tem parâmetros ajustáveis.';
+            this.paramsHolder.appendChild(none);
+            return;
+        }
+
+        const values = this._valuesFor(scenario);
+        for (let i = 0; i < specs.length; i++) {
+            const control = this._buildControl(specs[i], values);
+            if (control) {
+                this.paramsHolder.appendChild(control);
+            }
+        }
+    }
+
+    _buildControl(spec, values) {
+        const self = this;
+        const type = ScenarioPicker.typeOf(spec);
+
+        const field = document.createElement('div');
+        field.className = 'nv-param';
+        field.dataset.type = type;
+
+        const label = document.createElement('label');
+        label.className = 'nv-param__label';
+        label.textContent = ScenarioPicker.textOf(spec.label, spec.key);
+
+        const valueTag = document.createElement('span');
+        valueTag.className = 'nv-param__value';
+
+        const head = document.createElement('div');
+        head.className = 'nv-param__head';
+        head.appendChild(label);
+        head.appendChild(valueTag);
+        field.appendChild(head);
+
+        const inputs = document.createElement('div');
+        inputs.className = 'nv-param__inputs';
+        field.appendChild(inputs);
+
+        const id = 'nv-param-' + ScenarioPicker.slug(spec.key) + '-' + (this.controls.length + 1);
+        const write = function (value) {
+            values[spec.key] = value;
+        };
+
+        if (type === 'bool') {
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.id = id;
+            checkbox.className = 'nv-param__check';
+            checkbox.checked = values[spec.key] === true;
+            checkbox.addEventListener('change', function () {
+                write(checkbox.checked);
+                valueTag.textContent = checkbox.checked ? 'Sim' : 'Não';
+            });
+            label.setAttribute('for', id);
+            valueTag.textContent = checkbox.checked ? 'Sim' : 'Não';
+            inputs.appendChild(checkbox);
+            this.controls.push({ spec: spec, input: checkbox });
+
+        } else if (type === 'choice') {
+            const select = document.createElement('select');
+            select.id = id;
+            select.className = 'nv-param__select';
+            const choices = Array.isArray(spec.choices) ? spec.choices : [];
+            for (let i = 0; i < choices.length; i++) {
+                const choice = choices[i];
+                if (!choice || choice.value === undefined) {
+                    continue;
+                }
+                const option = document.createElement('option');
+                option.value = String(choice.value);
+                option.textContent = ScenarioPicker.textOf(choice.label, String(choice.value));
+                select.appendChild(option);
+            }
+            select.value = String(values[spec.key]);
+            if (select.selectedIndex < 0 && select.options.length > 0) {
+                select.selectedIndex = 0;
+                write(ScenarioPicker.choiceValue(spec, select.value));
+            }
+            select.addEventListener('change', function () {
+                write(ScenarioPicker.choiceValue(spec, select.value));
+            });
+            label.setAttribute('for', id);
+            inputs.appendChild(select);
+            this.controls.push({ spec: spec, input: select });
+
+        } else {
+            const isInteger = (type === 'int');
+            const min = ScenarioPicker.finiteOr(spec.min, null);
+            const max = ScenarioPicker.finiteOr(spec.max, null);
+            const step = ScenarioPicker.stepOf(spec, isInteger);
+
+            const number = document.createElement('input');
+            number.type = 'number';
+            number.id = id;
+            number.className = 'nv-param__number';
+            if (min !== null) { number.min = String(min); }
+            if (max !== null) { number.max = String(max); }
+            number.step = String(step);
+            number.value = String(values[spec.key]);
+            label.setAttribute('for', id);
+
+            let slider = null;
+            if (min !== null && max !== null && max > min) {
+                slider = document.createElement('input');
+                slider.type = 'range';
+                slider.className = 'nv-param__range';
+                slider.min = String(min);
+                slider.max = String(max);
+                slider.step = String(step);
+                slider.value = String(values[spec.key]);
+                slider.setAttribute('aria-label', ScenarioPicker.textOf(spec.label, spec.key));
+                inputs.appendChild(slider);
+            }
+            inputs.appendChild(number);
+
+            if (typeof spec.unit === 'string' && spec.unit) {
+                const unit = document.createElement('span');
+                unit.className = 'nv-param__unit';
+                unit.textContent = spec.unit;
+                inputs.appendChild(unit);
+            }
+
+            const show = function (value) {
+                valueTag.textContent = ScenarioPicker.formatValue(value, isInteger) +
+                    ((typeof spec.unit === 'string' && spec.unit) ? ' ' + spec.unit : '');
+            };
+            show(values[spec.key]);
+
+            // The stored value is ALWAYS clamped; the text field is only
+            // rewritten on `change`, so half-typed numbers are not fought with.
+            const commit = function (raw, rewrite) {
+                const value = ScenarioPicker.clampValue(spec, raw);
+                write(value);
+                show(value);
+                if (slider) { slider.value = String(value); }
+                if (rewrite) { number.value = String(value); }
+            };
+
+            number.addEventListener('input', function () {
+                commit(number.value, false);
+            });
+            number.addEventListener('change', function () {
+                commit(number.value, true);
+            });
+            number.addEventListener('keydown', function (event) {
+                event.stopPropagation();
+            });
+            if (slider) {
+                slider.addEventListener('input', function () {
+                    commit(slider.value, true);
+                });
+                slider.addEventListener('keydown', function (event) {
+                    event.stopPropagation();
+                });
+            }
+            this.controls.push({ spec: spec, input: number, slider: slider });
+        }
+
+        if (typeof spec.help === 'string' && spec.help) {
+            const help = document.createElement('p');
+            help.className = 'nv-param__help';
+            help.textContent = spec.help;
+            field.appendChild(help);
+        }
+        return field;
+    }
+
+    // --- keyboard ----------------------------------------------------------
+
+    _handleKeyDown(event) {
+        if (!this.visible) {
+            return;
+        }
+        if (event.key === 'Escape') {
+            if (this.allowCancel && this.onCancel) {
+                event.preventDefault();
+                this.onCancel();
+            }
+            return;
+        }
+        // Enter starts, unless the focus is on a control that uses it itself
+        if (event.key === 'Enter' && !event.ctrlKey && !event.metaKey) {
+            const target = event.target;
+            const tag = (target && target.tagName) ? target.tagName.toUpperCase() : '';
+            if (tag === 'BUTTON' || tag === 'SELECT') {
+                return;
+            }
+            event.preventDefault();
+            this.start();
+        }
+    }
+
+    _handleCardKey(event) {
+        const key = event.key;
+        if (key !== 'ArrowDown' && key !== 'ArrowUp' &&
+            key !== 'ArrowRight' && key !== 'ArrowLeft') {
+            return;
+        }
+        if (this.cards.length === 0) {
+            return;
+        }
+        let index = this.cards.indexOf(event.target);
+        if (index === -1) {
+            index = 0;
+        } else {
+            index += (key === 'ArrowDown' || key === 'ArrowRight') ? 1 : -1;
+            index = (index + this.cards.length) % this.cards.length;
+        }
+        event.preventDefault();
+        const card = this.cards[index];
+        this.select(card.dataset.scenario);
+        if (card.focus) {
+            card.focus();
+        }
+    }
+
+    // =======================================================================
+    // ParamSpec helpers - the whole schema lives here and nowhere else
+    // =======================================================================
+
+    static specsOf(scenario) {
+        const params = (scenario && Array.isArray(scenario.params)) ? scenario.params : [];
+        const out = [];
+        for (let i = 0; i < params.length; i++) {
+            const spec = params[i];
+            if (spec && typeof spec === 'object' && typeof spec.key === 'string' && spec.key) {
+                out.push(spec);
+            }
+        }
+        return out;
+    }
+
+    /** Declared type, or the type inferred from the default / choices. */
+    static typeOf(spec) {
+        const declared = (spec && typeof spec.type === 'string') ? spec.type.toLowerCase() : '';
+        if (declared === 'int' || declared === 'integer') {
+            return 'int';
+        }
+        if (declared === 'float' || declared === 'number') {
+            return 'float';
+        }
+        if (declared === 'bool' || declared === 'boolean') {
+            return 'bool';
+        }
+        if (declared === 'choice' || declared === 'enum' || declared === 'select') {
+            return 'choice';
+        }
+        if (spec && Array.isArray(spec.choices) && spec.choices.length > 0) {
+            return 'choice';
+        }
+        if (spec && typeof spec.default === 'boolean') {
+            return 'bool';
+        }
+        if (spec && typeof spec.default === 'number' && Number.isInteger(spec.default) &&
+            (spec.step === undefined || spec.step === 1)) {
+            return 'int';
+        }
+        return 'float';
+    }
+
+    static finiteOr(value, fallback) {
+        return (typeof value === 'number' && isFinite(value)) ? value : fallback;
+    }
+
+    static stepOf(spec, isInteger) {
+        const declared = ScenarioPicker.finiteOr(spec.step, null);
+        if (declared !== null && declared > 0) {
+            return declared;
+        }
+        if (isInteger) {
+            return 1;
+        }
+        const min = ScenarioPicker.finiteOr(spec.min, null);
+        const max = ScenarioPicker.finiteOr(spec.max, null);
+        if (min !== null && max !== null && max > min) {
+            const span = (max - min) / 100;
+            // round to a power of ten so the control does not show noise
+            const magnitude = Math.pow(10, Math.floor(Math.log(span) / Math.LN10));
+            return magnitude > 0 ? magnitude : 0.01;
+        }
+        return 0.01;
+    }
+
+    /** The declared value of a choice, matched back from its stringified form. */
+    static choiceValue(spec, raw) {
+        const choices = Array.isArray(spec.choices) ? spec.choices : [];
+        for (let i = 0; i < choices.length; i++) {
+            if (choices[i] && String(choices[i].value) === raw) {
+                return choices[i].value;
+            }
+        }
+        return raw;
+    }
+
+    /**
+     * Coerce and clamp one value to its spec. Out-of-range and unparseable
+     * input never reaches the scenario: it falls back to the default.
+     */
+    static clampValue(spec, raw) {
+        const type = ScenarioPicker.typeOf(spec);
+
+        if (type === 'bool') {
+            if (typeof raw === 'boolean') {
+                return raw;
+            }
+            if (raw === 'true' || raw === 1 || raw === '1') {
+                return true;
+            }
+            if (raw === 'false' || raw === 0 || raw === '0') {
+                return false;
+            }
+            return spec.default === true;
+        }
+
+        if (type === 'choice') {
+            const choices = Array.isArray(spec.choices) ? spec.choices : [];
+            for (let i = 0; i < choices.length; i++) {
+                if (choices[i] && String(choices[i].value) === String(raw)) {
+                    return choices[i].value;
+                }
+            }
+            if (spec.default !== undefined) {
+                return spec.default;
+            }
+            return (choices.length > 0 && choices[0]) ? choices[0].value : raw;
+        }
+
+        let value = (typeof raw === 'number') ? raw : parseFloat(raw);
+        if (typeof value !== 'number' || !isFinite(value)) {
+            value = ScenarioPicker.finiteOr(spec.default, 0);
+        }
+        if (type === 'int') {
+            value = Math.round(value);
+        }
+        const min = ScenarioPicker.finiteOr(spec.min, null);
+        const max = ScenarioPicker.finiteOr(spec.max, null);
+        if (min !== null && value < min) {
+            value = min;
+        }
+        if (max !== null && value > max) {
+            value = max;
+        }
+        return value;
+    }
+
+    static categoryLabel(category) {
+        if (typeof category !== 'string' || !category) {
+            return '';
+        }
+        const known = NV_CATEGORY_LABELS[category];
+        if (known) {
+            return known;
+        }
+        return category.charAt(0).toUpperCase() + category.slice(1);
+    }
+
+    static textOf(value, fallback) {
+        return (typeof value === 'string' && value) ? value : fallback;
+    }
+
+    static slug(text) {
+        return String(text).replace(/[^a-zA-Z0-9_-]/g, '');
+    }
+
+    static formatValue(value, isInteger) {
+        if (typeof value !== 'number' || !isFinite(value)) {
+            return String(value);
+        }
+        if (isInteger) {
+            return Math.round(value).toLocaleString('pt-BR');
+        }
+        const magnitude = Math.abs(value);
+        if (magnitude !== 0 && (magnitude < 1e-3 || magnitude >= 1e6)) {
+            return value.toExponential(2).replace('.', ',').replace('e+', 'e');
+        }
+        return value.toLocaleString('pt-BR', { maximumFractionDigits: 4 });
     }
 }
