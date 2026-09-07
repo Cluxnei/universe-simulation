@@ -13,10 +13,23 @@
         <meta name="copyright" content="© 2020 Kelvin Cluxnei" />
         <meta name="rating" content="general" />
         <link rel="shortcut icon" href="img/favicon.ico" type="image/x-icon">
-        <link rel="shortcut icon" href="img/favicon.png" type="image/png">
         <link rel="stylesheet" href="css/style.css">
+        <!-- Load order matters and is enforced here. main.js used to inject these
+             with a require() helper, but dynamically inserted scripts ignore the
+             defer attribute and execute out of order. -->
         <script src="js/libs/three.js" defer></script>
         <script src="js/libs/orbit-controls.js" defer></script>
+        <script src="js/constants.js" defer></script>
+        <script src="js/helpers.js" defer></script>
+        <script src="js/vector.js" defer></script>
+        <script src="js/element.js" defer></script>
+        <script src="js/periodic-table.js" defer></script>
+        <script src="js/composition.js" defer></script>
+        <script src="js/octree.js" defer></script>
+        <script src="js/planet.js" defer></script>
+        <script src="js/simulation.js" defer></script>
+        <script src="js/camera-controller.js" defer></script>
+        <script src="js/ui.js" defer></script>
         <script src="js/main.js" defer></script>
     </head>
     <body>

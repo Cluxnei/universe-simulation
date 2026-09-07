@@ -1,12 +1,768 @@
-*{
+/* ==========================================================================
+   Universe Simulation — 3D scene + navigation overlay
+   Dark, high contrast, spacey. All overlay classes are namespaced `nv-`.
+   ========================================================================== */
+
+* {
     margin: 0;
     padding: 0;
+    box-sizing: border-box;
 }
-body{
-    background-color: black;
-}
-canvas{
-    position: absolute;
+
+html,
+body {
     width: 100%;
     height: 100%;
+    overflow: hidden;
+}
+
+body {
+    background-color: #000;
+    color: #d6e2f5;
+}
+
+/* the WebGL canvas keeps filling the viewport, below every panel */
+canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    z-index: 0;
+    outline: none;
+}
+
+/* ==========================================================================
+   design tokens
+   ========================================================================== */
+
+:root {
+    --nv-font: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Fira Mono",
+               Menlo, Consolas, "Liberation Mono", monospace;
+
+    --nv-panel-bg: rgba(9, 13, 22, 0.74);
+    --nv-panel-bg-solid: rgba(9, 13, 22, 0.94);
+    --nv-border: rgba(120, 168, 255, 0.20);
+    --nv-border-strong: rgba(120, 168, 255, 0.42);
+
+    --nv-text: #d8e4f7;
+    --nv-dim: #7b8aa6;
+    --nv-faint: #4d5a72;
+
+    --nv-accent: #6fd3ff;
+    --nv-accent-soft: rgba(111, 211, 255, 0.14);
+    --nv-gold: #ffc46b;
+    --nv-warn: #ff8f7a;
+
+    --nv-radius: 10px;
+    --nv-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+}
+
+/* ==========================================================================
+   overlay root — never steals pointer events from the 3D view
+   ========================================================================== */
+
+.nv-root {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 10;
+    pointer-events: none;
+    font-family: var(--nv-font);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--nv-text);
+    -webkit-font-smoothing: antialiased;
+}
+
+/* only actual widgets capture the mouse */
+.nv-panel,
+.nv-playback,
+.nv-toast,
+.nv-help--on {
+    pointer-events: auto;
+}
+
+.nv-root--paused::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    pointer-events: none;
+    box-shadow: inset 0 0 0 2px rgba(255, 196, 107, 0.30);
+}
+
+/* ==========================================================================
+   panels
+   ========================================================================== */
+
+.nv-panel {
+    position: absolute;
+    background: var(--nv-panel-bg);
+    border: 1px solid var(--nv-border);
+    border-radius: var(--nv-radius);
+    box-shadow: var(--nv-shadow);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    overflow: hidden;
+}
+
+.nv-panel__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 10px;
+    cursor: pointer;
+    user-select: none;
+    background: linear-gradient(180deg, rgba(111, 211, 255, 0.09), rgba(111, 211, 255, 0));
+    border-bottom: 1px solid var(--nv-border);
+}
+
+.nv-panel--collapsed .nv-panel__header {
+    border-bottom-color: transparent;
+}
+
+.nv-panel__title {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--nv-accent);
+}
+
+.nv-panel__toggle {
+    flex: 0 0 auto;
+    width: 20px;
+    height: 20px;
+    line-height: 1;
+    font-family: inherit;
+    font-size: 13px;
+    color: var(--nv-dim);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--nv-border);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.nv-panel__toggle:hover {
+    color: var(--nv-accent);
+    border-color: var(--nv-border-strong);
+}
+
+.nv-panel__body {
+    padding: 9px 10px 10px;
+}
+
+.nv-panel--collapsed .nv-panel__body {
+    display: none;
+}
+
+/* ==========================================================================
+   stat grids (HUD, inspector, help)
+   ========================================================================== */
+
+.nv-stats {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 2px 10px;
+    align-items: baseline;
+}
+
+.nv-stats dt {
+    color: var(--nv-dim);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.nv-stats dd {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--nv-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nv-stats__highlight {
+    color: var(--nv-gold);
+    font-weight: 600;
+}
+
+/* ==========================================================================
+   HUD — top left
+   ========================================================================== */
+
+.nv-hud {
+    top: 14px;
+    left: 14px;
+    width: 258px;
+}
+
+/* ==========================================================================
+   body navigation panel — top right
+   ========================================================================== */
+
+.nv-bodies {
+    top: 14px;
+    right: 14px;
+    width: 346px;
+    display: flex;
+    flex-direction: column;
+    min-height: 150px;
+    max-height: calc(100vh - 352px);
+}
+
+.nv-bodies.nv-panel--collapsed {
+    min-height: 0;
+    max-height: none;
+    display: block;
+}
+
+.nv-bodies .nv-panel__body {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    gap: 7px;
+}
+
+.nv-search {
+    width: 100%;
+    padding: 6px 8px;
+    font-family: inherit;
+    font-size: 12px;
+    color: var(--nv-text);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--nv-border);
+    border-radius: 6px;
+    outline: none;
+}
+
+.nv-search::placeholder {
+    color: var(--nv-faint);
+}
+
+.nv-search:focus {
+    border-color: var(--nv-border-strong);
+    background: rgba(111, 211, 255, 0.07);
+}
+
+.nv-sortbar,
+.nv-speeds,
+.nv-modes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+
+.nv-chip {
+    padding: 3px 8px;
+    font-family: inherit;
+    font-size: 11px;
+    color: var(--nv-dim);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--nv-border);
+    border-radius: 999px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.nv-chip:hover {
+    color: var(--nv-text);
+    border-color: var(--nv-border-strong);
+}
+
+.nv-chip--active {
+    color: #04121c;
+    background: var(--nv-accent);
+    border-color: var(--nv-accent);
+    font-weight: 600;
+}
+
+.nv-chip--active[data-direction="asc"]::after {
+    content: " ↑";
+}
+
+.nv-chip--active[data-direction="desc"]::after {
+    content: " ↓";
+}
+
+.nv-chip--action {
+    color: var(--nv-gold);
+    border-color: rgba(255, 196, 107, 0.32);
+}
+
+.nv-chip--action:hover {
+    color: #12100a;
+    background: var(--nv-gold);
+}
+
+/* --- the scrollable list ------------------------------------------------ */
+
+.nv-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    margin: 0 -4px;
+    padding: 0 4px;
+}
+
+.nv-list::-webkit-scrollbar {
+    width: 8px;
+}
+
+.nv-list::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.nv-list::-webkit-scrollbar-thumb {
+    background: rgba(120, 168, 255, 0.22);
+    border-radius: 8px;
+}
+
+.nv-list::-webkit-scrollbar-thumb:hover {
+    background: rgba(120, 168, 255, 0.40);
+}
+
+.nv-row {
+    display: grid;
+    grid-template-columns: 12px minmax(0, 1fr) auto 24px;
+    grid-template-rows: auto auto;
+    align-items: center;
+    column-gap: 7px;
+    padding: 4px 5px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+}
+
+.nv-row:hover {
+    background: rgba(111, 211, 255, 0.09);
+}
+
+.nv-row--selected {
+    background: var(--nv-accent-soft);
+    border-color: var(--nv-border-strong);
+}
+
+.nv-row--followed {
+    border-color: rgba(255, 196, 107, 0.55);
+}
+
+.nv-row--followed .nv-row__label {
+    color: var(--nv-gold);
+}
+
+.nv-swatch {
+    grid-column: 1;
+    grid-row: 1 / 3;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #8899aa;
+    box-shadow: 0 0 6px rgba(255, 255, 255, 0.28);
+    align-self: center;
+}
+
+.nv-swatch--lg {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 auto;
+}
+
+.nv-row__label {
+    grid-column: 2;
+    grid-row: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--nv-text);
+}
+
+.nv-row__distance {
+    grid-column: 3;
+    grid-row: 1;
+    font-variant-numeric: tabular-nums;
+    color: var(--nv-accent);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.nv-row__numbers {
+    grid-column: 2 / 4;
+    grid-row: 2;
+    font-size: 10px;
+    color: var(--nv-faint);
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nv-row__follow {
+    grid-column: 4;
+    grid-row: 1 / 3;
+    width: 22px;
+    height: 22px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1;
+    color: var(--nv-faint);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: color 0.12s, border-color 0.12s;
+}
+
+.nv-row:hover .nv-row__follow {
+    color: var(--nv-dim);
+    border-color: var(--nv-border);
+}
+
+.nv-row__follow:hover {
+    color: var(--nv-gold);
+    border-color: rgba(255, 196, 107, 0.55);
+}
+
+.nv-list__footer {
+    flex: 0 0 auto;
+    padding-top: 5px;
+    border-top: 1px solid var(--nv-border);
+    font-size: 10px;
+    color: var(--nv-faint);
+    text-align: right;
+}
+
+/* ==========================================================================
+   inspector — bottom right
+   ========================================================================== */
+
+.nv-inspector {
+    right: 14px;
+    bottom: 72px;
+    width: 346px;
+}
+
+.nv-inspector__head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 7px;
+    padding-bottom: 7px;
+    border-bottom: 1px solid var(--nv-border);
+}
+
+.nv-inspector__name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--nv-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nv-panel--empty .nv-inspector__name {
+    color: var(--nv-faint);
+    font-weight: 400;
+}
+
+.nv-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 9px;
+}
+
+.nv-button {
+    flex: 1 1 auto;
+    padding: 6px 10px;
+    font-family: inherit;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    color: var(--nv-text);
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--nv-border);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.nv-button:hover:not(:disabled) {
+    background: rgba(111, 211, 255, 0.14);
+    border-color: var(--nv-border-strong);
+}
+
+.nv-button:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+
+.nv-button--primary {
+    color: var(--nv-accent);
+    border-color: rgba(111, 211, 255, 0.40);
+}
+
+.nv-button--warn {
+    color: var(--nv-gold);
+    border-color: rgba(255, 196, 107, 0.50);
+    background: rgba(255, 196, 107, 0.10);
+}
+
+/* ==========================================================================
+   playback bar — bottom centre
+   ========================================================================== */
+
+.nv-playback {
+    position: absolute;
+    left: 50%;
+    bottom: 14px;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 11px;
+    background: var(--nv-panel-bg);
+    border: 1px solid var(--nv-border);
+    border-radius: 999px;
+    box-shadow: var(--nv-shadow);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    max-width: calc(100vw - 28px);
+    flex-wrap: wrap;
+    justify-content: center;
+}
+
+.nv-playback__pause {
+    flex: 0 0 auto;
+    min-width: 84px;
+    border-radius: 999px;
+}
+
+.nv-speeds,
+.nv-modes {
+    position: relative;
+    padding-left: 10px;
+}
+
+.nv-speeds::before,
+.nv-modes::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 10%;
+    height: 80%;
+    border-left: 1px solid var(--nv-border);
+}
+
+/* ==========================================================================
+   help overlay
+   ========================================================================== */
+
+.nv-help {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(2, 4, 9, 0.62);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+}
+
+.nv-help--on {
+    display: flex;
+}
+
+.nv-help__dialog {
+    width: min(760px, 100%);
+    max-height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: var(--nv-panel-bg-solid);
+    border: 1px solid var(--nv-border-strong);
+    border-radius: 12px;
+    box-shadow: var(--nv-shadow);
+    overflow: hidden;
+}
+
+.nv-help__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--nv-border);
+    background: linear-gradient(180deg, rgba(111, 211, 255, 0.10), rgba(111, 211, 255, 0));
+}
+
+.nv-help__header h2 {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--nv-accent);
+}
+
+.nv-help__content {
+    padding: 14px;
+    overflow-y: auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+}
+
+.nv-help__group h3 {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--nv-gold);
+    margin-bottom: 6px;
+}
+
+.nv-help__group .nv-stats {
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 4px 10px;
+}
+
+.nv-help__group .nv-stats dd {
+    text-align: left;
+    color: var(--nv-dim);
+    white-space: normal;
+}
+
+.nv-help kbd {
+    display: inline-block;
+    padding: 1px 6px;
+    font-family: inherit;
+    font-size: 11px;
+    color: var(--nv-text);
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid var(--nv-border);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+
+/* ==========================================================================
+   crosshair (free-fly mode) + toasts
+   ========================================================================== */
+
+.nv-crosshair {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 14px;
+    height: 14px;
+    margin: -7px 0 0 -7px;
+    display: none;
+    pointer-events: none;
+}
+
+.nv-crosshair--on {
+    display: block;
+}
+
+.nv-crosshair::before,
+.nv-crosshair::after {
+    content: "";
+    position: absolute;
+    background: rgba(111, 211, 255, 0.75);
+}
+
+.nv-crosshair::before {
+    left: 50%;
+    top: 0;
+    width: 1px;
+    height: 100%;
+    margin-left: -0.5px;
+}
+
+.nv-crosshair::after {
+    top: 50%;
+    left: 0;
+    height: 1px;
+    width: 100%;
+    margin-top: -0.5px;
+}
+
+.nv-toasts {
+    position: absolute;
+    left: 14px;
+    bottom: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-width: 320px;
+    pointer-events: none;
+}
+
+.nv-toast {
+    padding: 7px 11px;
+    font-size: 11px;
+    color: var(--nv-text);
+    background: var(--nv-panel-bg-solid);
+    border: 1px solid var(--nv-border-strong);
+    border-left: 3px solid var(--nv-gold);
+    border-radius: 7px;
+    box-shadow: var(--nv-shadow);
+    opacity: 1;
+    transform: translateY(0);
+    transition: opacity 0.35s ease, transform 0.35s ease;
+}
+
+.nv-toast--out {
+    opacity: 0;
+    transform: translateY(8px);
+}
+
+/* ==========================================================================
+   compact viewports
+   ========================================================================== */
+
+@media (max-width: 900px), (max-height: 620px) {
+    .nv-hud {
+        width: 220px;
+    }
+
+    .nv-bodies {
+        width: 300px;
+        max-height: calc(100vh - 300px);
+    }
+
+    .nv-inspector {
+        width: 300px;
+        bottom: 64px;
+    }
+}
+
+@media (max-width: 680px) {
+    .nv-hud,
+    .nv-bodies,
+    .nv-inspector {
+        width: calc(100vw - 28px);
+    }
+
+    .nv-bodies {
+        top: auto;
+        bottom: 64px;
+        max-height: 46vh;
+    }
+
+    .nv-inspector {
+        display: none;
+    }
 }
