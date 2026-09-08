@@ -482,9 +482,179 @@ function displayRadiusOfBlackHole(planet) {
     return Math.min(Math.max(drawn, floor), ceiling);
 }
 
+// ---------------------------------------------------------------------------
+// Tidal debris: presentation only
+// ---------------------------------------------------------------------------
+//
+// js/debris.js replaces a tidally disrupted star with hundreds of fragments and
+// marks every one of them with planet.isDebris === true. A fragment is about a
+// six-hundredth of a solar mass, which structure.js correctly calls a brown
+// dwarf - and six hundred brown dwarfs is not what a tidal stream looks like.
+//
+// isDebris is therefore treated here as an ORTHOGONAL PRESENTATION FLAG: the
+// classification, the mass, the radius and everything else the physics computed
+// are left exactly as they are, and only the drawn size, the drawn colour and
+// the layers a fragment is allowed into change. Every function below degrades
+// to the old behaviour when the flag is absent, which is what happens with an
+// older simulation.js or with TIDAL_DEBRIS_ENABLED off.
+
+function isDebrisBody(planet) {
+    return !!planet && planet.isDebris === true;
+}
+
+// A fragment is drawn at the smallest size the renderer gives a body, scaled by
+// the cube root of its mass against a NOMINAL fragment - a solar mass cut into
+// TIDAL_DEBRIS_PARTICLES pieces - and clamped to a narrow band around it. The
+// ordinary curve would hand it 0.09 AU, a third of the drawn size of the star it
+// came from; at that size the stream is a cloud of marbles. The cube root is
+// what makes a coalesced remnant (debris.js merges escaped fragments, up to
+// TIDAL_DEBRIS_MAX_PARTICLE_MASS each) read as the bigger thing it is.
+const DEBRIS_RADIUS_MIN_FACTOR = 0.5;       // x renderRadiusMin
+const DEBRIS_RADIUS_MAX_FACTOR = 2;
+const DEBRIS_NOMINAL_PARTICLES = 600;       // fallback when constants.js is older
+
+function debrisReferenceMass() {
+    const count = positiveOr(typeof TIDAL_DEBRIS_PARTICLES !== 'undefined'
+        ? TIDAL_DEBRIS_PARTICLES : 0, DEBRIS_NOMINAL_PARTICLES);
+    return 1 / count;
+}
+
+function displayRadiusOfDebris(planet) {
+    const base = renderRadiusMin;
+    const mass = (planet && typeof planet.mass === 'number' && planet.mass > 0) ? planet.mass : 0;
+    const reference = debrisReferenceMass();
+    let drawn = base;
+    if (mass > 0 && reference > 0) {
+        drawn = base * Math.cbrt(mass / reference);
+    }
+    if (!isFinite(drawn)) {
+        drawn = base;
+    }
+    return Math.min(Math.max(drawn, base * DEBRIS_RADIUS_MIN_FACTOR),
+        base * DEBRIS_RADIUS_MAX_FACTOR);
+}
+
+// Fragment colour. Two things about a fragment are real, and js/debris.js has
+// already put both of them on the body, so neither costs a solve:
+//
+//   - HOW HOT IT IS. Debris is shock-heated where the star came apart and cools
+//     as the stream expands, so it is drawn bright near the hole and dim far
+//     from it. The length scale is the fragment's own debrisEscapeRadius
+//     (hundreds of tidal radii), which is exactly the range the stream is
+//     visible over, rather than an invented number.
+//   - WHETHER IT COMES BACK. The energy spread across the star straddles zero,
+//     so about half the stream is bound and returns to light the hole and half
+//     leaves forever. They are two physically different populations and they are
+//     drawn as two: the bound half warm, the escaping half cold and blue.
+//
+// THE VALUES ARE DELIBERATELY OVER-BRIGHT. Bodies are Lambert-shaded, and a
+// system that has just lost its only star to a black hole has no light left in
+// it but the ambient one - 0x8fa8cc at intensity 0.5, i.e. a per-channel
+// multiplier of 0.28 / 0.33 / 0.40 on the instance colour. Dividing through by
+// that is what makes a fragment read as something that glows instead of as a
+// rock at dusk. The products stay at or below 1, so nothing clips to white; a
+// fragment that does end up near a surviving star is lit brighter still, which
+// is honest.
+const DEBRIS_BOUND_HOT = [3.20, 2.40, 1.40];    // -> 0.90 0.79 0.56 white-gold
+const DEBRIS_BOUND_COLD = [0.70, 0.26, 0.10];   // -> 0.20 0.09 0.04 dim ember
+const DEBRIS_FREE_HOT = [2.00, 2.20, 2.50];     // -> 0.56 0.72 1.00 white-blue
+const DEBRIS_FREE_COLD = [0.45, 0.52, 0.80];    // -> 0.13 0.17 0.32 cold slate
+// Half-brightness distance, as a fraction of the escape radius.
+const DEBRIS_FADE_FRACTION = 0.15;
+// Used when the fragment has no host to measure a distance against.
+const DEBRIS_DEFAULT_HEAT = 0.35;
+const DEBRIS_FALLBACK_FADE_AU = 20;
+
+const _debrisColor = new THREE.Color();
+
+// Flat colour for the one orbit line a fragment can get, by being selected or
+// followed. Not the live stream colour: an orbit slot keeps its THREE.Color
+// across frames, and the stream's is a scratch object rewritten every frame.
+// Matches --nv-class-debris in css/style.css, which is what the panel's swatch
+// and class chip use.
+const DEBRIS_LINE_COLOR = '#ffb066';
+
+/** 1 where the star was destroyed, falling towards 0 as the stream expands. */
+function debrisHeat(planet, host) {
+    if (!host || host.removed || !host.position || !planet.position) {
+        return DEBRIS_DEFAULT_HEAT;
+    }
+    const dx = planet.position.x - host.position.x;
+    const dy = planet.position.y - host.position.y;
+    const dz = planet.position.z - host.position.z;
+    const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (!isFinite(distance)) {
+        return DEBRIS_DEFAULT_HEAT;
+    }
+    let scale = positiveOr(planet.debrisEscapeRadius, 0) * DEBRIS_FADE_FRACTION;
+    if (!(scale > 0)) {
+        scale = positiveOr(planet.debrisReturnRadius, 0) * 8;
+    }
+    if (!(scale > 0)) {
+        scale = DEBRIS_FALLBACK_FADE_AU;
+    }
+    return scale / (scale + distance);
+}
+
+/**
+ * Is this fragment still bound to the hole that destroyed its star? Same test
+ * debris.js uses for its own cleanup: the hole is the whole potential and the
+ * fragment a test particle. Anything unmeasurable counts as bound, which is the
+ * quieter of the two colours.
+ */
+function debrisIsBound(planet, host) {
+    if (!host || !host.position || !host.velocity || !planet.velocity) {
+        return true;
+    }
+    const mass = (typeof host.mass === 'number' && host.mass > 0) ? host.mass : 0;
+    if (!(mass > 0)) {
+        return true;
+    }
+    const dx = planet.position.x - host.position.x;
+    const dy = planet.position.y - host.position.y;
+    const dz = planet.position.z - host.position.z;
+    const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (!(distance > 0)) {
+        return true;
+    }
+    const vx = planet.velocity.x - host.velocity.x;
+    const vy = planet.velocity.y - host.velocity.y;
+    const vz = planet.velocity.z - host.velocity.z;
+    const g = positiveOr(typeof GRAVITATION_CONSTANT !== 'undefined'
+        ? GRAVITATION_CONSTANT : 0, 39.478);
+    const energy = 0.5 * (vx * vx + vy * vy + vz * vz) - g * mass / distance;
+    return !(energy > 0);
+}
+
+/**
+ * Colour of one fragment, in a shared scratch THREE.Color. setColorAt() copies
+ * the components out immediately (r147 InstancedMesh.setColorAt -> toArray), so
+ * one instance is safe to reuse for every fragment in the frame.
+ */
+function debrisColorOf(planet) {
+    const host = (planet && planet.debrisHost) ? planet.debrisHost : null;
+    let heat = debrisHeat(planet, host);
+    if (!(heat >= 0)) {
+        heat = 0;
+    } else if (heat > 1) {
+        heat = 1;
+    }
+    const bound = debrisIsBound(planet, host);
+    const hot = bound ? DEBRIS_BOUND_HOT : DEBRIS_FREE_HOT;
+    const cold = bound ? DEBRIS_BOUND_COLD : DEBRIS_FREE_COLD;
+    return _debrisColor.setRGB(
+        cold[0] + (hot[0] - cold[0]) * heat,
+        cold[1] + (hot[1] - cold[1]) * heat,
+        cold[2] + (hot[2] - cold[2]) * heat
+    );
+}
+
 function displayRadiusOf(planet) {
     if (isBlackHoleBody(planet)) {
         return displayRadiusOfBlackHole(planet);
+    }
+    if (isDebrisBody(planet)) {
+        return displayRadiusOfDebris(planet);
     }
     return displayRadius(planet && typeof planet.radius === 'number' ? planet.radius : 0);
 }
@@ -1698,6 +1868,15 @@ function updateOrbitTargets() {
                 if (starSet.has(planet)) {
                     continue;
                 }
+                // Debris is ranked by mass like everything else, and every
+                // fragment of one star has the SAME mass - so a disruption would
+                // hand the whole ranking to a few hundred near-identical
+                // plunging ellipses and evict the bodies the user came for. The
+                // selected and followed bodies were pushed above and are not
+                // affected, so a fragment the user picks still gets its orbit.
+                if (isDebrisBody(planet)) {
+                    continue;
+                }
                 ranking.push(planet);
             }
             ranking.sort(compareByMassDescending);
@@ -2005,7 +2184,13 @@ function repackOrbitSlots(now) {
             continue;
         }
 
-        slot.color = cachedColor(colorOf(planet));
+        // Debris only ever reaches a slot by being selected or followed (the
+        // mass ranking skips it). The stream's own colour is a live scratch
+        // object rewritten every frame, so the CACHED constant is used here: a
+        // slot keeps its colour across frames and must not alias it.
+        slot.color = isDebrisBody(planet)
+            ? cachedColor(DEBRIS_LINE_COLOR)
+            : cachedColor(colorOf(planet));
         if (wantEllipses) {
             packEllipse(index, planet, focusFor(planet), slot.color);
         }
@@ -2213,7 +2398,9 @@ function syncInstances() {
         _scale.setScalar(displayRadiusOf(planet));
         _matrix.compose(_position, _quaternion, _scale);
         bodyMesh.setMatrixAt(written, _matrix);
-        bodyMesh.setColorAt(written, cachedColor(colorOf(planet)));
+        bodyMesh.setColorAt(written, isDebrisBody(planet)
+            ? debrisColorOf(planet)
+            : cachedColor(colorOf(planet)));
         planetIds[written] = planet.id;
         written++;
     }
@@ -3832,7 +4019,10 @@ function buildRun(id, params) {
         segments: mobileMode ? MOBILE_DETAIL_SEGMENTS : 48,
         getCamera: () => camera,
         radiusOf: displayRadiusOf,
-        skip: (planet) => starSet.has(planet)
+        // Stars are drawn by the star layer over there; debris is never worth a
+        // 512 px procedural texture - a fragment is a few pixels wide, and six
+        // hundred of them would evict the textures of every body that matters.
+        skip: (planet) => starSet.has(planet) || isDebrisBody(planet)
     });
 
     world.add(createStarLayer());

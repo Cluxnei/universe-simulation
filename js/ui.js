@@ -50,8 +50,27 @@ const NV_CLASSES = [
     // Not a mass class like the others - a black hole of 10 Msun and a star of
     // 10 Msun differ by collapse, not by mass - but it belongs at the end of the
     // list because it is where the sequence ends.
-    { key: 'blackHole', label: 'Buracos negros', singular: 'Buraco negro' }
+    { key: 'blackHole', label: 'Buracos negros', singular: 'Buraco negro' },
+    // NOT a class structure.js returns, and deliberately so. A fragment of a
+    // tidally disrupted star (js/debris.js, planet.isDebris) weighs about a
+    // six-hundredth of a solar mass, so classify() calls it a brown dwarf and is
+    // arithmetically right - but reporting six hundred "anãs marrons" describes
+    // nothing that is on the screen. Debris is keyed off isDebris and counted
+    // here instead, and the physics classification is left untouched.
+    // `search` overrides what the list's filter matches this class on. Only
+    // debris needs it: the class is named in the plural everywhere it is shown
+    // ("600 destroços"), so a user types the plural and the singular badge text
+    // would never match it.
+    { key: 'debris', label: 'Destroços', singular: 'Destroço', search: 'Destroços Destroço' }
 ];
+
+/**
+ * Swatch colour for a fragment. planet.color() would hand back the dim
+ * red-brown of the brown dwarf it weighs the same as; the stream is drawn as
+ * hot stripped gas, and the panel says the same thing. Keep in step with
+ * --nv-class-debris in css/style.css.
+ */
+const NV_DEBRIS_COLOR = '#ffb066';
 
 /**
  * Presets for the "Adicionar corpo" tool.
@@ -201,6 +220,10 @@ class NavigatorUI {
         this.sortKey = 'axis';
         this.sortAscending = true;
         this.filterText = '';
+        // Fragments of a tidal disruption are counted but not listed until the
+        // user asks: see _refreshList().
+        this.showDebris = false;
+        this._debrisChipCount = -1;
         this.helpVisible = false;
         this.guidesOn = true;
         this.orbitMode = 'ellipses';
@@ -303,7 +326,7 @@ class NavigatorUI {
                     }
                 } catch (e) { /* keep the built-in label */ }
             }
-            entry.searchable = NavigatorUI.normalizeText(entry.resolved);
+            entry.searchable = NavigatorUI.normalizeText(entry.search || entry.resolved);
         }
         return entry.resolved;
     }
@@ -320,12 +343,76 @@ class NavigatorUI {
         return NV_CLASSES[rank].searchable || '';
     }
 
-    /** The class of a body, defaulting to `asteroid` when unclassified. */
+    /**
+     * Is this body a tidal-debris fragment? The flag is absent on every body
+     * when js/debris.js is not loaded or TIDAL_DEBRIS_ENABLED is off, so this is
+     * false everywhere and nothing that reads it changes behaviour.
+     */
+    static isDebris(planet) {
+        return !!planet && planet.isDebris === true;
+    }
+
+    /**
+     * The class of a body, defaulting to `asteroid` when unclassified.
+     *
+     * Debris overrides the physics classification HERE AND ONLY HERE, for the
+     * badge, the tally and the class sort - planet.classification itself is
+     * never touched and never disagreed with elsewhere.
+     */
     static classOf(planet) {
+        if (NavigatorUI.isDebris(planet)) {
+            return 'debris';
+        }
         const value = planet && planet.classification;
         return (typeof value === 'string' && NV_CLASS_RANK[value] !== undefined)
             ? value
             : 'asteroid';
+    }
+
+    /** The pt-BR name of a body's kind, debris included. */
+    static labelOf(planet) {
+        if (NavigatorUI.isDebris(planet)) {
+            return NavigatorUI.classNameOf('debris');
+        }
+        return (planet && typeof planet.classLabel === 'string' && planet.classLabel)
+            ? planet.classLabel
+            : NavigatorUI.classNameOf(NavigatorUI.classOf(planet));
+    }
+
+    /**
+     * One pt-BR line about a fragment: which half of the stream it is in, which
+     * is the physically meaningful thing about it. Bound debris returns to the
+     * hole and is what lights the flare; unbound debris leaves and never comes
+     * back. Returns null for anything that is not debris, which hides the row.
+     */
+    static debrisNoteOf(planet) {
+        if (!NavigatorUI.isDebris(planet)) {
+            return null;
+        }
+        const host = planet.debrisHost || null;
+        try {
+            if (host && !host.removed && host.position && host.velocity &&
+                planet.position && planet.velocity && host.mass > 0) {
+                const dx = planet.position.x - host.position.x;
+                const dy = planet.position.y - host.position.y;
+                const dz = planet.position.z - host.position.z;
+                const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                if (distance > 0) {
+                    const vx = planet.velocity.x - host.velocity.x;
+                    const vy = planet.velocity.y - host.velocity.y;
+                    const vz = planet.velocity.z - host.velocity.z;
+                    const g = (typeof GRAVITATION_CONSTANT === 'number' &&
+                        isFinite(GRAVITATION_CONSTANT) && GRAVITATION_CONSTANT > 0)
+                        ? GRAVITATION_CONSTANT : 39.478;
+                    const energy = 0.5 * (vx * vx + vy * vy + vz * vz) -
+                        g * host.mass / distance;
+                    return energy > 0
+                        ? 'Fragmento livre · escapa e não retorna'
+                        : 'Fragmento ligado · volta ao buraco negro';
+                }
+            }
+        } catch (e) { /* fall through to the generic note */ }
+        return 'Fragmento de uma ruptura por maré';
     }
 
     // =======================================================================
@@ -648,6 +735,22 @@ class NavigatorUI {
             this.sortButtons[key] = button;
         }
 
+        // Debris toggle. Hidden while no body carries isDebris, which is every
+        // scenario until a star is torn apart (and every scenario at all with
+        // TIDAL_DEBRIS_ENABLED off), so it costs nothing to have here.
+        const debrisToggle = document.createElement('button');
+        debrisToggle.type = 'button';
+        debrisToggle.className = 'nv-chip nv-chip--debris nv-hidden';
+        debrisToggle.textContent = 'Destroços';
+        debrisToggle.title = 'Listar também os fragmentos da ruptura por maré';
+        debrisToggle.setAttribute('aria-pressed', 'false');
+        debrisToggle.addEventListener('click', function () {
+            self.setShowDebris(!self.showDebris);
+            self._blur(debrisToggle);
+        });
+        this.debrisToggle = debrisToggle;
+        sortBar.appendChild(debrisToggle);
+
         const frameAll = document.createElement('button');
         frameAll.type = 'button';
         frameAll.className = 'nv-chip nv-chip--action';
@@ -749,6 +852,8 @@ class NavigatorUI {
         this._statRow(grid, this.inspectorFields, 'period', 'Período orbital');
         this._statRow(grid, this.inspectorFields, 'speed', 'Velocidade');
         this._statRow(grid, this.inspectorFields, 'distance', 'Dist. da câmera');
+        // Hidden for every ordinary body: _writeStat() hides a row written null.
+        this._statRow(grid, this.inspectorFields, 'debris', 'Ruptura por maré');
         body.appendChild(grid);
 
         // --- composition ---------------------------------------------------
@@ -2029,6 +2134,21 @@ class NavigatorUI {
         return this;
     }
 
+    /** Show or hide the individual debris rows in the body list. */
+    setShowDebris(value) {
+        const wanted = !!value;
+        if (wanted === this.showDebris) {
+            return this;
+        }
+        this.showDebris = wanted;
+        if (this.debrisToggle) {
+            this.debrisToggle.classList.toggle('nv-chip--active', wanted);
+            this.debrisToggle.setAttribute('aria-pressed', wanted ? 'true' : 'false');
+        }
+        this.refresh(true);
+        return this;
+    }
+
     setSort(key) {
         if (this.sortKey === key) {
             this.sortAscending = !this.sortAscending;
@@ -2151,6 +2271,20 @@ class NavigatorUI {
         const idFilter = /^#(\d+)$/.exec(this.filterText.trim());
         const wantedId = idFilter ? parseInt(idFilter[1], 10) : null;
 
+        // DEBRIS AND THE BODY LIST. One disruption puts ~600 fragments into the
+        // population in a single frame; listed, they bury the two or three
+        // bodies the scenario is actually about, and no sort order rescues that
+        // because every fragment has the same mass and nearly the same orbit.
+        //
+        // So they are COUNTED but not LISTED. They join the list on request -
+        // the "Destroços" chip, an explicit "#id" search, or a search that names
+        // the class - and the footer always says how many are being held back,
+        // so nothing is silently missing. Everything below is inert when no body
+        // carries isDebris, which is every scenario until a star is torn apart.
+        const debrisWanted = this.showDebris || wantedId !== null ||
+            (!!filter && NavigatorUI.classSearchTextOf('debris').indexOf(filter) !== -1);
+        let debrisHidden = 0;
+
         const entries = this._entries;
         const tally = this._classTally;
         for (let i = 0; i < NV_CLASSES.length; i++) {
@@ -2173,6 +2307,15 @@ class NavigatorUI {
             if (!this._largestFallback ||
                 (typeof planet.mass === 'number' && planet.mass > this._largestFallback.mass)) {
                 this._largestFallback = planet;
+            }
+
+            // Counted above, listed only on request. The `continue` is what
+            // keeps a disruption from costing anything: a hidden fragment never
+            // reaches the distance and semi-major-axis arithmetic below, never
+            // takes an entry out of the pool and never reaches the sort.
+            if (classification === 'debris' && !debrisWanted) {
+                debrisHidden++;
+                continue;
             }
 
             const composition = planet.composition || null;
@@ -2268,17 +2411,36 @@ class NavigatorUI {
             this._rows[i].element.style.display = 'none';
         }
 
+        // The toggle appears only once there is debris to toggle, and carries
+        // the count so the collapsed stream still reports its size. Both writes
+        // are guarded on the number changing, so this is a no-op per refresh in
+        // the steady state and completely absent without debris.
+        const debrisTotal = tally.debris || 0;
+        if (this.debrisToggle && this._debrisChipCount !== debrisTotal) {
+            this._debrisChipCount = debrisTotal;
+            this.debrisToggle.classList.toggle('nv-hidden', debrisTotal === 0);
+            this.debrisToggle.textContent = debrisTotal > 0
+                ? 'Destroços · ' + NavigatorUI.formatInteger(debrisTotal)
+                : 'Destroços';
+        }
+
+        let footer;
         if (count === 0) {
-            this.listFooter.textContent = this.filterText
+            footer = this.filterText
                 ? 'Nenhum corpo corresponde à busca.'
                 : 'Nenhum corpo na simulação.';
         } else if (count > shown) {
-            this.listFooter.textContent = 'Mostrando ' + NavigatorUI.formatInteger(shown) +
+            footer = 'Mostrando ' + NavigatorUI.formatInteger(shown) +
                 ' de ' + NavigatorUI.formatInteger(count) + ' corpos.';
         } else {
-            this.listFooter.textContent = NavigatorUI.formatInteger(count) +
+            footer = NavigatorUI.formatInteger(count) +
                 (count === 1 ? ' corpo.' : ' corpos.');
         }
+        if (debrisHidden > 0) {
+            footer += ' + ' + NavigatorUI.formatInteger(debrisHidden) +
+                (debrisHidden === 1 ? ' destroço oculto.' : ' destroços ocultos.');
+        }
+        this.listFooter.textContent = footer;
         this._totalBodies = total;
 
         this._markRows();
@@ -2490,7 +2652,18 @@ class NavigatorUI {
 
         // classCounts may arrive as a plain object or as a Map; anything else
         // falls back to the tally this panel computed while walking the bodies.
-        const published = (stats && stats.classCounts) ? stats.classCounts : null;
+        //
+        // WITH DEBRIS PRESENT THE PUBLISHED COUNTS ARE NOT WRONG, THEY ARE
+        // ANSWERING A DIFFERENT QUESTION: simulation.js tallies by
+        // planet.classification, so 600 fragments of a solar mass each report as
+        // 600 brown dwarfs. That is true of the masses and false of the system.
+        // The local tally was built in the same pass a moment ago, knows about
+        // isDebris, and is used for EVERY class as soon as any debris exists -
+        // mixing the two sources would double-count. With no debris anywhere
+        // this is exactly the old expression and the old behaviour.
+        const debrisPresent = (this._classTally.debris || 0) > 0;
+        const published = (!debrisPresent && stats && stats.classCounts)
+            ? stats.classCounts : null;
         const publishedIsMap = !!published && typeof published.get === 'function';
         for (let i = 0; i < NV_CLASSES.length; i++) {
             const key = NV_CLASSES[i].key;
@@ -2569,6 +2742,8 @@ class NavigatorUI {
             for (let i = 0; i < keys.length; i++) {
                 write(fields[keys[i]], '—');
             }
+            // A row that only ever applies to debris should be absent, not blank
+            write(fields.debris, null);
             this._writeComposition(null);
             this.inspectorButtons.follow.disabled = true;
             this.inspectorButtons.frame.disabled = true;
@@ -2583,17 +2758,20 @@ class NavigatorUI {
         this.inspectorButtons.follow.textContent = (this.following === planet) ? 'Seguindo' : 'Seguir';
 
         const classification = NavigatorUI.classOf(planet);
+        const debris = NavigatorUI.isDebris(planet);
         this.inspectorSwatch.style.backgroundColor = NavigatorUI.colorOf(planet);
         this.inspectorBadge.dataset.class = classification;
-        this.inspectorBadge.textContent = (typeof planet.classLabel === 'string' && planet.classLabel)
-            ? planet.classLabel
-            : NavigatorUI.classNameOf(classification);
+        // labelOf() prefers structure.js's own label for an ordinary body and
+        // says "Destroço" for a fragment, which is the one place the physics
+        // label would otherwise leak the brown dwarf back into the panel.
+        this.inspectorBadge.textContent = NavigatorUI.labelOf(planet);
 
         const composition = planet.composition || null;
         const element = (composition && composition.element) ? composition.element : null;
-        this.inspectorName.textContent = 'Corpo #' +
+        this.inspectorName.textContent = (debris ? 'Fragmento #' : 'Corpo #') +
             (planet.id !== undefined ? planet.id : '?') +
             (element && element.symbol ? '  ·  ' + element.symbol : '');
+        write(fields.debris, NavigatorUI.debrisNoteOf(planet));
 
         // --- structure ------------------------------------------------------
         write(fields.mass, typeof planet.mass === 'number'
@@ -2807,6 +2985,11 @@ class NavigatorUI {
     /** planet.color() first, then the composition colour, then a neutral grey. */
     static colorOf(planet) {
         if (planet) {
+            // A fragment's own colour is the brown dwarf's: overridden so the
+            // swatch matches the hot stream the renderer draws.
+            if (NavigatorUI.isDebris(planet)) {
+                return NV_DEBRIS_COLOR;
+            }
             if (typeof planet.color === 'function') {
                 try {
                     const value = planet.color();
@@ -2848,9 +3031,7 @@ class NavigatorUI {
         if (typeof planet !== 'object') {
             return null;
         }
-        const label = (typeof planet.classLabel === 'string' && planet.classLabel)
-            ? planet.classLabel
-            : NavigatorUI.classNameOf(NavigatorUI.classOf(planet));
+        const label = NavigatorUI.labelOf(planet);
         const id = (planet.id !== undefined) ? ' #' + planet.id : '';
         const mass = (typeof planet.mass === 'number')
             ? '  ·  ' + NavigatorUI.formatMass(planet.mass)

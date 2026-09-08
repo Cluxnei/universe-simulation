@@ -509,6 +509,15 @@ const TEXTURE_CLASSES = [TEXTURE_CLASS_ASTEROID, TEXTURE_CLASS_PLANET,
  * mass-based guess and is drawn as whatever it looks like - which is the right
  * degradation, not a bug.
  */
+/**
+ * A fragment of a tidally disrupted star (js/debris.js sets isDebris on every
+ * one of them). Never textured: see _skipped(). The flag is absent on every
+ * body when TIDAL_DEBRIS_ENABLED is off, so this is false everywhere then.
+ */
+function textureIsDebris(planet) {
+    return !!planet && planet.isDebris === true
+}
+
 function textureIsBlackHole(planet) {
     if (!planet) {
         return false
@@ -2627,6 +2636,14 @@ class DetailBodyPool {
                     return true
                 }
             } catch (e) { /* a broken predicate must not veto everything */ }
+        }
+        // A tidal-debris fragment is a few pixels wide and there are hundreds
+        // of them: a 512 px procedural texture on one is pure waste, and the
+        // pool would evict the textures of the bodies that matter to pay for it.
+        // Independent of `skipStars`, and of the caller's predicate, because
+        // there is no size at which detailing a fragment is the right call.
+        if (textureIsDebris(planet)) {
+            return true
         }
         if (!this.skipStars) {
             return false

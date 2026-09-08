@@ -300,6 +300,25 @@ canvas {
     border-color: rgba(255, 196, 107, 0.32);
 }
 
+/* The body list's "Destroços" toggle. Present only while a tidal stream
+   exists, so it carries the stream's own colour rather than the accent. */
+.nv-chip--debris {
+    color: var(--nv-class-debris);
+    border-color: rgba(255, 176, 102, 0.32);
+}
+
+.nv-chip--debris:hover {
+    color: #150c04;
+    background: var(--nv-class-debris);
+    border-color: var(--nv-class-debris);
+}
+
+.nv-chip--debris.nv-chip--active {
+    color: #150c04;
+    background: var(--nv-class-debris);
+    border-color: var(--nv-class-debris);
+}
+
 .nv-chip--action:hover {
     color: #12100a;
     background: var(--nv-gold);
@@ -760,6 +779,10 @@ canvas {
     --nv-class-star: #ffd166;
     /* An accretion disk's orange, since the hole itself has no colour to show. */
     --nv-class-blackHole: #ff9a4d;
+    /* Tidal debris: hot stripped stellar gas, the colour the stream is drawn
+       in by the render layer. Not a class structure.js returns - see the
+       `debris` entry in NV_CLASSES. */
+    --nv-class-debris: #ffb066;
 
     --nv-mat-gas: #d8c9a0;
     --nv-mat-ice: #cfe6f2;
@@ -799,6 +822,7 @@ canvas {
 .nv-badge[data-class="brownDwarf"] { color: var(--nv-class-brownDwarf); }
 .nv-badge[data-class="star"] { color: var(--nv-class-star); }
 .nv-badge[data-class="blackHole"] { color: var(--nv-class-blackHole); }
+.nv-badge[data-class="debris"] { color: var(--nv-class-debris); }
 
 /* --- HUD class tally ---------------------------------------------------- */
 
@@ -838,6 +862,8 @@ canvas {
 .nv-classchip[data-class="gasGiant"] .nv-classchip__dot { background: var(--nv-class-gasGiant); }
 .nv-classchip[data-class="brownDwarf"] .nv-classchip__dot { background: var(--nv-class-brownDwarf); }
 .nv-classchip[data-class="star"] .nv-classchip__dot { background: var(--nv-class-star); }
+.nv-classchip[data-class="blackHole"] .nv-classchip__dot { background: var(--nv-class-blackHole); }
+.nv-classchip[data-class="debris"] .nv-classchip__dot { background: var(--nv-class-debris); }
 
 .nv-classchip__name {
     flex: 1 1 auto;
