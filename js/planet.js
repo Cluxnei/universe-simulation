@@ -71,6 +71,10 @@ class Planet{
         // of searching the star list for each of them.
         this.starIndex = -1
         this.removed = false
+        // Set by js/debris.js on the fragments of a tidally disrupted star. It
+        // only changes the accretion radius below; nothing else in the physics
+        // reads it. Always false unless TIDAL_DEBRIS_ENABLED.
+        this.isDebris = false
         // Derived quantities, all filled by refreshStructure().
         this.radius = 0
         this.density = 0
@@ -129,6 +133,12 @@ class Planet{
             ? STAR_ACCRETION_RADIUS_FACTOR
             : ACCRETION_RADIUS_FACTOR
         this.accretionRadius = this.radius * factor
+        // Tidal debris does not accrete onto tidal debris. A fragment given the
+        // ordinary factor would have a collision target of ~0.8 AU and the
+        // whole stream would clump back into a ball within a few steps. See
+        // TIDAL_DEBRIS_ACCRETION_RADIUS_FACTOR in constants.js and js/debris.js.
+        if(this.isDebris)
+            this.accretionRadius = this.radius * TIDAL_DEBRIS_ACCRETION_RADIUS_FACTOR
         // A body that emits its own light is coloured by its blackbody spectrum;
         // anything else is coloured by what it is made of. A planet's luminosity
         // is ~0, so its blackbody colour would be a meaningless clamped red.

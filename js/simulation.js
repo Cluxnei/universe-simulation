@@ -603,7 +603,14 @@ class Simulation{
             velocity.z += (paz[i] + az[i]) * halfDt
         }
         this.accelerationsValid = true
-        const changes = this.resolveCollisions()
+        let changes = this.resolveCollisions()
+        // Tidal debris fallback and cleanup (js/debris.js). It returns the same
+        // bitmask resolveCollisions does - 1 when it removed a body - so the
+        // compact() below picks its removals up with no further plumbing. With
+        // TIDAL_DEBRIS_ENABLED off, or with debris.js not loaded at all, both
+        // tests fold away and nothing is called.
+        if(TIDAL_DEBRIS_ENABLED && typeof tidalDebrisTick === 'function')
+            changes |= tidalDebrisTick(this, false)
         if(changes & 1)
             this.compact()
         if(changes !== 0)
@@ -907,6 +914,15 @@ class Simulation{
         for(let i = 0; i < n; i++){
             const a = planets[i]
             if(a.removed) continue
+            // Tidal debris is collisionless (js/debris.js). Skipping it here and
+            // in the inner loop below keeps a six-hundred-fragment stream out of
+            // the pair tests entirely: the grid sizes its cells from the hole's
+            // capture reach, a stream is a thin filament, so every fragment
+            // lands in the same handful of cells and the broad phase would
+            // otherwise generate the full N^2 - 180000 candidate pairs a step,
+            // measured, every one of them rejected for a contact distance of
+            // zero. Both tests fold away when the feature is off.
+            if(TIDAL_DEBRIS_ENABLED && TIDAL_DEBRIS_COLLISIONLESS && a.isDebris) continue
             const gx = this.cellX[i], gy = this.cellY[i], gz = this.cellZ[i]
             let visitedCount = 0
             for(let ox = -1; ox <= 1 && !a.removed; ox++){
@@ -925,6 +941,8 @@ class Simulation{
                             if(j <= i) continue
                             const b = planets[j]
                             if(b.removed) continue
+                            if(TIDAL_DEBRIS_ENABLED && TIDAL_DEBRIS_COLLISIONLESS &&
+                                b.isDebris) continue
                             flags |= this.handlePair(a, b)
                             if(a.removed) break
                         }
@@ -956,6 +974,15 @@ class Simulation{
     captureReach(body, other){
         if(!body.isBlackHole)
             return body.accretionRadius
+        // A HOLE DOES NOT CAPTURE ITS OWN DEBRIS THROUGH THIS RULE. The rule is
+        // the pairwise tidal radius, which depends only on the hole's mass and
+        // the victim's MEAN DENSITY - and a fragment of a shredded star is a
+        // degenerate blob barely denser than the star was, so its tidal radius
+        // is nearly the star's own. The hole would swallow the entire stream
+        // during the disruption passage itself and nothing would ever escape.
+        // Fallback is decided by tidalDebrisTick() instead, after a full orbit.
+        if(TIDAL_DEBRIS_ENABLED && other.isDebris)
+            return 0
         return blackHoleCaptureRadius(body.mass, other.mass, other.radius)
     }
 
@@ -1054,8 +1081,17 @@ class Simulation{
         // mass, momentum and every element exactly conserved, which is the
         // property worth protecting, and the mass that arrives is what drives
         // the accretion disk's luminosity in updateBlackHoleAccretion().
-        if(receiver.isBlackHole)
+        if(receiver.isBlackHole){
             this.tidalDisruptions++
+            // THE HOOK for the debris stream (js/debris.js). It returns true
+            // only when it has taken the disruption over and replaced the
+            // victim with fragments; with TIDAL_DEBRIS_ENABLED off - or with
+            // debris.js not loaded at all - it is false on its first line and
+            // everything below runs exactly as it always did.
+            if(typeof tidalDebrisDisrupt === 'function' &&
+                tidalDebrisDisrupt(this, receiver, donor))
+                return 1
+        }
         donor.mergeInto(receiver)
         donor.removed = true
         return 1
