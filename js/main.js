@@ -100,11 +100,16 @@ let onSpawnedHandler = null;
 // Mobile mode
 // ---------------------------------------------------------------------------
 //
-// A phone gets a SEMI-FIXED view: no orbiting, no pinch, no fly, no pointer
-// lock. Each scenario publishes the viewpoint it wants to be seen from through
+// A phone gets a SEMI-FIXED view: no fly mode, no pointer lock, no picking.
+// Each scenario publishes the viewpoint it wants to be seen from through
 // `meta.mobileView` (see CameraController.normalizeMobileView), the camera sits
-// there and drifts slowly around the disk normal, and the UI shrinks to what is
-// useful with no controls at all.
+// there and drifts slowly around the disk normal, and the UI shrinks to a
+// read-only strip plus a few buttons.
+//
+// That view is not frozen, though: one finger turns it (azimuth / elevation)
+// and two pinch it (distance), all inside CameraController's own fixed-view
+// parameters - OrbitControls is never re-enabled. "Recentrar" puts the
+// scenario's framing back. See the touch-look section of camera-controller.js.
 //
 // DETECTION is a coarse pointer plus a small viewport, never the user agent: a
 // laptop with a touchscreen reports `pointer: fine` for its primary pointer and
@@ -3868,7 +3873,17 @@ function buildRun(id, params) {
         },
         onTogglePause: () => { if (ui) ui.togglePause(); },
         onToggleHelp: () => { if (ui) ui.toggleHelp(); },
-        onNotice: (message) => { if (ui) ui.notify(message); }
+        onNotice: (message) => { if (ui) ui.notify(message); },
+        // The mobile touch dolly moves the viewing distance, and the near / far
+        // planes on that build are derived from it (see applyCameraClipping).
+        // The controller throttles this, so it is a handful of calls per pinch.
+        onFixedDistanceChange: (distance) => {
+            if (!mobileMode || !(distance > 0)) {
+                return;
+            }
+            mobileViewDistance = distance;
+            applyCameraClipping();
+        }
     });
     // OrbitControls is created and owned by the controller.
     controls = cameraController.controls;
@@ -3908,6 +3923,14 @@ function buildRun(id, params) {
         onOrbitModeChange: (mode) => setOrbitMode(mode),
         onOrbitScopeChange: (scope) => setOrbitScope(scope),
         onChangeScenario: () => openPicker(),
+        // Mobile only: back to the framing meta.mobileView asked for, undoing
+        // whatever the user's fingers did to the angles, the distance and the
+        // target nudge.
+        onRecenter: () => {
+            if (cameraController) {
+                cameraController.resetFixedView();
+            }
+        },
         onSpawnArm: (armed) => setSpawnArmed(armed),
         onSpawnConfigChange: () => { spawnContextTimer = SPAWN_CONTEXT_INTERVAL; },
         onSpawnUndo: () => undoLastSpawn()

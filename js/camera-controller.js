@@ -40,6 +40,9 @@ class CameraController {
      *   onTogglePause  {Function} () => void
      *   onToggleHelp   {Function} () => void
      *   onNotice       {Function} (messageInPortuguese) => void
+     *   onFixedDistanceChange {Function} (distance) => void   fired when the
+     *                  touch dolly changes the semi-fixed view's distance, so
+     *                  the integrator can re-derive the near / far planes
      */
     constructor(camera, domElement, options) {
         options = options || {};
@@ -60,6 +63,7 @@ class CameraController {
         this.onTogglePause = options.onTogglePause || null;
         this.onToggleHelp = options.onToggleHelp || null;
         this.onNotice = options.onNotice || null;
+        this.onFixedDistanceChange = options.onFixedDistanceChange || null;
 
         // --- OrbitControls -------------------------------------------------
         this.controls = new THREE.OrbitControls(camera, domElement);
@@ -127,6 +131,20 @@ class CameraController {
         // click vs drag discrimination
         this._pointerDown = null;
 
+        // --- touch look (semi-fixed view only) -----------------------------
+        // A MAP keyed by pointerId, never a single "is dragging" flag: a finger
+        // lifting out of a two-finger pinch is a change of CONFIGURATION, not
+        // the end of the gesture, and only a map can tell the two apart.
+        this._touchPointers = new Map();
+        this._touchGesture = null;         // {x, y, radius} of the whole hand
+        this._touchListening = false;
+        this._touchViewport = { width: 1, height: 1 };
+        this._touchMoved = 0;              // px accumulated, tap vs drag
+        this._touchIdle = Infinity;        // REAL seconds since the last finger left
+        this._fixedHome = null;            // the scenario's framing, for "Recentrar"
+        this._fixedPan = new THREE.Vector3();
+        this._fixedDistanceSent = 0;       // last value handed to onFixedDistanceChange
+
         this._bind();
         this._attach();
     }
@@ -154,6 +172,17 @@ class CameraController {
         this._onPointerLockChange = this._handlePointerLockChange.bind(this);
         this._onBlur = this._handleBlur.bind(this);
         this._onContextMenu = function (event) { event.preventDefault(); };
+        this._onTouchPointerDown = this._handleTouchPointerDown.bind(this);
+        this._onTouchPointerMove = this._handleTouchPointerMove.bind(this);
+        this._onTouchPointerUp = this._handleTouchPointerUp.bind(this);
+        this._onTouchPointerCancel = this._handleTouchPointerCancel.bind(this);
+        // Safari pinch-zooms the whole PAGE over the canvas unless these three
+        // are cancelled; no other browser fires them.
+        this._onTouchGestureBlock = function (event) {
+            if (event && event.cancelable !== false && typeof event.preventDefault === 'function') {
+                event.preventDefault();
+            }
+        };
     }
 
     _attach() {
@@ -171,6 +200,7 @@ class CameraController {
     }
 
     dispose() {
+        this._detachTouch();
         window.removeEventListener('keydown', this._onKeyDown, false);
         window.removeEventListener('keyup', this._onKeyUp, false);
         window.removeEventListener('blur', this._onBlur, false);
@@ -190,7 +220,11 @@ class CameraController {
      * it keeps a running flight framed correctly.
      */
     handleResize() {
-        // no cached viewport state; kept for API symmetry and future-proofing
+        // The only cached viewport state is the one the touch look normalises
+        // its rotation by; everything else is read lazily.
+        if (this._touchListening) {
+            this._readTouchViewport();
+        }
         return this;
     }
 
@@ -862,6 +896,17 @@ class CameraController {
 
         this.fixedView = view;
         this._fixedAzimuth = view.azimuth * Math.PI / 180;
+        // The scenario's framing is the STARTING point and the reset target;
+        // the touch look moves `view` itself and clamps against this copy.
+        this._fixedHome = {
+            distance: view.distance,
+            elevation: view.elevation,
+            azimuth: view.azimuth
+        };
+        this._fixedPan.set(0, 0, 0);
+        this._fixedDistanceSent = view.distance;
+        this._touchIdle = Infinity;    // the drift starts at full speed
+        this._touchClear();
         this._fixedTarget = null;
         this._fixedTimer = Infinity;   // force an immediate re-acquisition
         this.mode = CameraController.ORBIT;
@@ -876,6 +921,10 @@ class CameraController {
         this._keys = Object.create(null);
         this.exitPointerLock();
 
+        // The ONLY place the touch handlers are registered: on the desktop
+        // build, where setFixedView() is never called, they do not exist.
+        this._attachTouch();
+
         this._applyFixedView(0, true);
         return this;
     }
@@ -885,8 +934,12 @@ class CameraController {
         if (!this.fixedView) {
             return this;
         }
+        this._detachTouch();
         this.fixedView = null;
         this._fixedTarget = null;
+        this._fixedHome = null;
+        this._fixedPan.set(0, 0, 0);
+        this._fixedDistanceSent = 0;
         if (this.camera.up && this.camera.up.copy) {
             this.camera.up.copy(this._fixedSavedUp);
         }
@@ -908,12 +961,19 @@ class CameraController {
             dt = 0;
         }
 
+        this._touchIdle += dt;
+
         // Real seconds, so the drift is the same at 1x and at 4x, and continues
-        // while the simulation is paused.
+        // while the simulation is paused. It is suspended while a finger is on
+        // the glass and fades back in a few idle seconds later: a drift that
+        // fights the user's own gesture reads as a broken camera.
         if (view.autoRotate) {
-            const twoPi = Math.PI * 2;
-            this._fixedAzimuth += view.autoRotate * Math.PI / 180 * dt;
-            this._fixedAzimuth = ((this._fixedAzimuth % twoPi) + twoPi) % twoPi;
+            const scale = this._autoRotateScale();
+            if (scale > 0) {
+                const twoPi = Math.PI * 2;
+                this._fixedAzimuth += view.autoRotate * scale * Math.PI / 180 * dt;
+                this._fixedAzimuth = ((this._fixedAzimuth % twoPi) + twoPi) % twoPi;
+            }
         }
 
         this._fixedTimer += dt;
@@ -933,6 +993,15 @@ class CameraController {
             this._readPosition(this._fixedTarget, point);
         } else if (view.target) {
             point.set(view.target.x, view.target.y, view.target.z);
+        }
+
+        // The two-finger midpoint nudge, if any. Clamped in _clampFixedPan(),
+        // so it can never carry the frame off the system entirely.
+        const pan = this._fixedPan;
+        if (pan && isFinite(pan.x) && isFinite(pan.y) && isFinite(pan.z)) {
+            point.x += pan.x;
+            point.y += pan.y;
+            point.z += pan.z;
         }
 
         const offset = CameraController.mobileOffsetFromBasis(
@@ -1003,6 +1072,473 @@ class CameraController {
         }
         const kind = planet.classification;
         return kind === 'star' || kind === 'blackHole';
+    }
+
+    // -----------------------------------------------------------------------
+    // touch look (semi-fixed view only)
+    // -----------------------------------------------------------------------
+    //
+    // The semi-fixed view is a yaw / pitch / dolly camera in disguise: `azimuth`
+    // IS the yaw, `elevation` IS the pitch and `distance` IS the dolly. So a
+    // phone needs no second camera system to look around - one finger drives the
+    // two angles, two fingers drive the distance (and nudge the target), and
+    // every one of them is the view's OWN parameter, clamped to a neighbourhood
+    // of the framing the scenario asked for. OrbitControls stays off throughout.
+    //
+    // The handlers are registered by setFixedView() and removed by
+    // clearFixedView() / dispose(), so on the desktop build - which never calls
+    // setFixedView() - not one of them is ever attached.
+    //
+    // THE INVARIANT WORTH STATING: the gesture (its midpoint and its mean
+    // radius) is recomputed on EVERY change of the pointer list - down, up and
+    // cancel alike. The next pointermove therefore measures against the new
+    // configuration, so adding or lifting a finger mid-gesture produces exactly
+    // zero delta instead of a jump.
+
+    /** Degrees of yaw for a swipe across the FULL canvas width. */
+    static get TOUCH_YAW_SPAN() { return 240; }
+    /** Degrees of pitch for a swipe across the FULL canvas height. */
+    static get TOUCH_PITCH_SPAN() { return 160; }
+    /** px: two fingers closer than this give a meaningless pinch ratio. */
+    static get TOUCH_MIN_RADIUS() { return 8; }
+    /** Dolly range, as a multiple of the scenario's own distance. */
+    static get TOUCH_DISTANCE_MIN() { return 0.15; }
+    static get TOUCH_DISTANCE_MAX() { return 8; }
+    /** The midpoint drag is a nudge, not a free pan. */
+    static get TOUCH_PAN_FACTOR() { return 0.5; }
+    /** How far the target may be nudged, as a multiple of the distance. */
+    static get TOUCH_PAN_LIMIT() { return 1.5; }
+    /** Seconds of an untouched screen before the drift comes back... */
+    static get TOUCH_RESUME_DELAY() { return 3; }
+    /** ...and the seconds it takes to fade back in once it does. */
+    static get TOUCH_RESUME_RAMP() { return 1; }
+
+    /** Is at least one finger currently driving the view? */
+    isTouchActive() {
+        return !!(this._touchPointers && this._touchPointers.size);
+    }
+
+    /** How many pointers the view is tracking (diagnostics, tests). */
+    touchPointerCount() {
+        return this._touchPointers ? this._touchPointers.size : 0;
+    }
+
+    _attachTouch() {
+        if (this._touchListening || !this.domElement || !this.domElement.addEventListener) {
+            return this;
+        }
+        const element = this.domElement;
+        // passive:false on the two that call preventDefault(); the browser
+        // assumes passive for touch pointers otherwise and ignores the call.
+        element.addEventListener('pointerdown', this._onTouchPointerDown, { passive: false });
+        element.addEventListener('pointermove', this._onTouchPointerMove, { passive: false });
+        element.addEventListener('pointerup', this._onTouchPointerUp, false);
+        element.addEventListener('pointercancel', this._onTouchPointerCancel, false);
+        // A pointer whose capture is stolen (a system gesture, the browser
+        // taking over the scroll) may never send pointerup: without this it
+        // would sit in the map forever as a phantom finger.
+        element.addEventListener('lostpointercapture', this._onTouchPointerCancel, false);
+        element.addEventListener('gesturestart', this._onTouchGestureBlock, { passive: false });
+        element.addEventListener('gesturechange', this._onTouchGestureBlock, { passive: false });
+        element.addEventListener('gestureend', this._onTouchGestureBlock, { passive: false });
+        this._touchListening = true;
+        this._readTouchViewport();
+        return this;
+    }
+
+    _detachTouch() {
+        if (this._touchListening && this.domElement && this.domElement.removeEventListener) {
+            const element = this.domElement;
+            element.removeEventListener('pointerdown', this._onTouchPointerDown, { passive: false });
+            element.removeEventListener('pointermove', this._onTouchPointerMove, { passive: false });
+            element.removeEventListener('pointerup', this._onTouchPointerUp, false);
+            element.removeEventListener('pointercancel', this._onTouchPointerCancel, false);
+            element.removeEventListener('lostpointercapture', this._onTouchPointerCancel, false);
+            element.removeEventListener('gesturestart', this._onTouchGestureBlock, { passive: false });
+            element.removeEventListener('gesturechange', this._onTouchGestureBlock, { passive: false });
+            element.removeEventListener('gestureend', this._onTouchGestureBlock, { passive: false });
+        }
+        this._touchListening = false;
+        this._touchClear();
+        return this;
+    }
+
+    /** Forget every finger. Never leaves a stale gesture behind. */
+    _touchClear() {
+        if (this._touchPointers && this._touchPointers.size) {
+            this._touchPointers.clear();
+        }
+        this._touchGesture = null;
+        this._touchMoved = 0;
+        return this;
+    }
+
+    /**
+     * Cache the canvas size. Read once per gesture (and on resize) rather than
+     * per pointermove, because getBoundingClientRect() forces a layout.
+     */
+    _readTouchViewport() {
+        let width = 0;
+        let height = 0;
+        try {
+            const rect = this.domElement.getBoundingClientRect();
+            width = CameraController.safeNumber(rect.width, 0);
+            height = CameraController.safeNumber(rect.height, 0);
+        } catch (e) {
+            width = 0;
+            height = 0;
+        }
+        if (!(width > 0) || !(height > 0)) {
+            try {
+                if (!(width > 0)) { width = CameraController.safeNumber(window.innerWidth, 0); }
+                if (!(height > 0)) { height = CameraController.safeNumber(window.innerHeight, 0); }
+            } catch (e) { /* no window: the fallbacks below take over */ }
+        }
+        this._touchViewport.width = width > 0 ? width : 1;
+        this._touchViewport.height = height > 0 ? height : 1;
+        return this._touchViewport;
+    }
+
+    /**
+     * The midpoint of every tracked pointer and their MEAN RADIUS about it.
+     * With two fingers the mean radius is exactly half their separation, so the
+     * ratio of the old radius to the new one IS the pinch factor.
+     *
+     * A NEW object is stored each time: the previous one is held by the caller
+     * as the "before" state and must never be mutated underneath it.
+     */
+    _touchSyncGesture() {
+        const pointers = this._touchPointers;
+        if (!pointers || !pointers.size) {
+            this._touchGesture = null;
+            return null;
+        }
+        let sumX = 0;
+        let sumY = 0;
+        pointers.forEach(function (point) {
+            sumX += point.x;
+            sumY += point.y;
+        });
+        const count = pointers.size;
+        const centerX = sumX / count;
+        const centerY = sumY / count;
+        let radius = 0;
+        pointers.forEach(function (point) {
+            const dx = point.x - centerX;
+            const dy = point.y - centerY;
+            radius += Math.sqrt(dx * dx + dy * dy);
+        });
+        this._touchGesture = { x: centerX, y: centerY, radius: radius / count };
+        return this._touchGesture;
+    }
+
+    /**
+     * Every pointer over the canvas drives the fixed view. The mouse is
+     * included deliberately: `?mobile=1` on a desktop browser is how this build
+     * is inspected, and no desktop path can reach here anyway - the handlers
+     * are not registered unless the fixed view is on.
+     */
+    _handleTouchPointerDown(event) {
+        if (!this.fixedView || !event) {
+            return;
+        }
+        CameraController.preventTouchDefault(event);
+        if (!this._touchPointers.size) {
+            this._readTouchViewport();
+            this._touchMoved = 0;
+        }
+        if (this.domElement && typeof this.domElement.setPointerCapture === 'function') {
+            try { this.domElement.setPointerCapture(event.pointerId); } catch (e) { /* optional */ }
+        }
+        this._touchPointers.set(event.pointerId, {
+            x: CameraController.safeNumber(event.clientX, 0),
+            y: CameraController.safeNumber(event.clientY, 0)
+        });
+        this._touchIdle = 0;
+        // Recompute NOW, so the first move after this finger landed measures
+        // against the hand as it is and not as it was.
+        this._touchSyncGesture();
+    }
+
+    _handleTouchPointerMove(event) {
+        if (!this.fixedView || !event) {
+            return;
+        }
+        const tracked = this._touchPointers.get(event.pointerId);
+        if (!tracked) {
+            return;              // a pointer we never saw go down
+        }
+        CameraController.preventTouchDefault(event);
+
+        const previous = this._touchGesture;
+        tracked.x = CameraController.safeNumber(event.clientX, tracked.x);
+        tracked.y = CameraController.safeNumber(event.clientY, tracked.y);
+        const current = this._touchSyncGesture();
+        this._touchIdle = 0;
+        if (!previous || !current) {
+            return;
+        }
+
+        const dx = current.x - previous.x;
+        const dy = current.y - previous.y;
+        if (!isFinite(dx) || !isFinite(dy)) {
+            return;
+        }
+        this._touchMoved += Math.abs(dx) + Math.abs(dy);
+
+        if (this._touchPointers.size < 2) {
+            this._touchRotate(dx, dy);
+            return;
+        }
+        this._touchDolly(previous.radius, current.radius);
+        this._touchPan(dx, dy);
+    }
+
+    _handleTouchPointerUp(event) {
+        if (event) {
+            this._touchRelease(event.pointerId);
+        }
+    }
+
+    /** pointercancel AND lostpointercapture both land here. */
+    _handleTouchPointerCancel(event) {
+        if (event) {
+            this._touchRelease(event.pointerId);
+        }
+    }
+
+    _touchRelease(pointerId) {
+        if (!this._touchPointers || !this._touchPointers.has(pointerId)) {
+            return;   // already gone: releasePointerCapture() fires lostpointercapture
+        }
+        this._touchPointers.delete(pointerId);
+        if (this.domElement && typeof this.domElement.releasePointerCapture === 'function') {
+            try {
+                if (typeof this.domElement.hasPointerCapture !== 'function'
+                    || this.domElement.hasPointerCapture(pointerId)) {
+                    this.domElement.releasePointerCapture(pointerId);
+                }
+            } catch (e) { /* optional */ }
+        }
+        // Recompute against the fingers that are LEFT: this is what makes
+        // lifting one finger of a pinch a zero-delta event.
+        this._touchSyncGesture();
+        if (!this._touchPointers.size) {
+            this._touchIdle = 0;
+            this._touchMoved = 0;
+        }
+    }
+
+    /** One finger: yaw and pitch, normalised by the canvas. */
+    _touchRotate(dx, dy) {
+        const view = this.fixedView;
+        if (!view) {
+            return;
+        }
+        const width = this._touchViewport.width > 0 ? this._touchViewport.width : 1;
+        const height = this._touchViewport.height > 0 ? this._touchViewport.height : 1;
+
+        // Normalised by the CANVAS, never by a fixed pixels-to-radians constant:
+        // the same physical gesture - half a screen - has to turn the same angle
+        // on a 360 px phone and on a 1100 px tablet.
+        const yaw = (dx / width) * CameraController.TOUCH_YAW_SPAN * Math.PI / 180;
+        const pitch = (dy / height) * CameraController.TOUCH_PITCH_SPAN;
+        if (!isFinite(yaw) || !isFinite(pitch)) {
+            return;
+        }
+
+        // Dragging right walks the camera left around the target, so the scene
+        // follows the finger instead of running away from it.
+        const twoPi = Math.PI * 2;
+        this._fixedAzimuth = (((this._fixedAzimuth - yaw) % twoPi) + twoPi) % twoPi;
+        // Clamped and NEVER wrapped: at +-90 the view direction is parallel to
+        // `up` and lookAt() degenerates into a roll.
+        view.elevation = CameraController.clampNumber(view.elevation + pitch, -89, 89);
+    }
+
+    /** Two fingers: the ratio of the mean radii is the pinch factor. */
+    _touchDolly(previousRadius, currentRadius) {
+        if (!this.fixedView) {
+            return;
+        }
+        const floor = CameraController.TOUCH_MIN_RADIUS;
+        if (!(previousRadius > floor) || !(currentRadius > floor)) {
+            return;              // fingers on top of each other: the ratio is noise
+        }
+        let factor = previousRadius / currentRadius;
+        if (!(typeof factor === 'number' && isFinite(factor) && factor > 0)) {
+            return;
+        }
+        // Fingers apart -> larger radius -> factor < 1 -> closer.
+        factor = CameraController.clampNumber(factor, 0.2, 5);
+        this.setFixedDistance(this.fixedView.distance * factor);
+    }
+
+    /**
+     * Set the semi-fixed view's distance, clamped to a sane multiple of the
+     * distance the scenario asked for.
+     */
+    setFixedDistance(value) {
+        const view = this.fixedView;
+        if (!view) {
+            return this;
+        }
+        const home = (this._fixedHome && this._fixedHome.distance > 0)
+            ? this._fixedHome.distance
+            : view.distance;
+        const min = Math.max(home * CameraController.TOUCH_DISTANCE_MIN, 1e-3);
+        const max = Math.max(Math.min(home * CameraController.TOUCH_DISTANCE_MAX, 1e7), min);
+        view.distance = CameraController.clampNumber(value, min, max);
+        this._clampFixedPan();
+        this._emitFixedDistance(false);
+        return this;
+    }
+
+    /**
+     * Tell the integrator the viewing distance moved, so it can re-derive the
+     * near / far planes. Throttled by ratio: a pinch fires a dozen moves a
+     * second and each one would otherwise rebuild the projection matrix.
+     */
+    _emitFixedDistance(force) {
+        const view = this.fixedView;
+        if (!view || !this.onFixedDistanceChange) {
+            return;
+        }
+        const sent = this._fixedDistanceSent;
+        if (!force && sent > 0) {
+            const ratio = view.distance / sent;
+            if (ratio > 0.97 && ratio < 1.03) {
+                return;
+            }
+        }
+        this._fixedDistanceSent = view.distance;
+        try { this.onFixedDistanceChange(view.distance); } catch (e) { console.error(e); }
+    }
+
+    /**
+     * Two fingers, midpoint moving: nudge the look-at point across the screen
+     * plane. Deliberately modest and hard-clamped - the scenario's framing is
+     * still what the view is about.
+     *
+     * With the camera at azimuth `az` and elevation `el` around the disk normal
+     * n, and (u, v, n) right-handed:
+     *
+     *     screen right =  v cos(az) - u sin(az)
+     *     screen up    =  n cos(el) - (u cos(az) + v sin(az)) sin(el)
+     */
+    _touchPan(dx, dy) {
+        const view = this.fixedView;
+        if (!view) {
+            return;
+        }
+        const height = this._touchViewport.height > 0 ? this._touchViewport.height : 1;
+        const fov = CameraController.clampNumber(
+            CameraController.safeNumber(this.camera && this.camera.fov, 70), 1, 179);
+        // world units per pixel at the target's depth
+        const scale = 2 * view.distance * Math.tan(fov * Math.PI / 360) / height;
+        const step = scale * CameraController.TOUCH_PAN_FACTOR;
+        if (!(typeof step === 'number' && isFinite(step) && step > 0)) {
+            return;
+        }
+
+        const elevation = CameraController.clampNumber(view.elevation, -89, 89) * Math.PI / 180;
+        const ca = Math.cos(this._fixedAzimuth);
+        const sa = Math.sin(this._fixedAzimuth);
+        const ce = Math.cos(elevation);
+        const se = Math.sin(elevation);
+        const u = this._fixedU;
+        const v = this._fixedV;
+        const n = this._fixedN;
+
+        const rightX = v.x * ca - u.x * sa;
+        const rightY = v.y * ca - u.y * sa;
+        const rightZ = v.z * ca - u.z * sa;
+        const upX = n.x * ce - (u.x * ca + v.x * sa) * se;
+        const upY = n.y * ce - (u.y * ca + v.y * sa) * se;
+        const upZ = n.z * ce - (u.z * ca + v.z * sa) * se;
+
+        // The world slides WITH the fingers, so the target moves the other way.
+        const pan = this._fixedPan;
+        pan.x += (upX * dy - rightX * dx) * step;
+        pan.y += (upY * dy - rightY * dx) * step;
+        pan.z += (upZ * dy - rightZ * dx) * step;
+        this._clampFixedPan();
+    }
+
+    _clampFixedPan() {
+        const pan = this._fixedPan;
+        const view = this.fixedView;
+        if (!pan || !view) {
+            return;
+        }
+        if (!isFinite(pan.x) || !isFinite(pan.y) || !isFinite(pan.z)) {
+            pan.set(0, 0, 0);
+            return;
+        }
+        const limit = view.distance * CameraController.TOUCH_PAN_LIMIT;
+        const length = Math.sqrt(pan.x * pan.x + pan.y * pan.y + pan.z * pan.z);
+        if (length > limit && length > 0) {
+            const shrink = limit / length;
+            pan.set(pan.x * shrink, pan.y * shrink, pan.z * shrink);
+        }
+    }
+
+    /**
+     * How much of the scenario's drift applies this frame: none while a finger
+     * is down, then a fade back in once the screen has been idle a while.
+     */
+    _autoRotateScale() {
+        if (this._touchPointers && this._touchPointers.size) {
+            return 0;
+        }
+        const idle = this._touchIdle;
+        if (!(typeof idle === 'number' && isFinite(idle))) {
+            return 1;            // never touched (Infinity): full speed
+        }
+        const delay = CameraController.TOUCH_RESUME_DELAY;
+        if (idle <= delay) {
+            return 0;
+        }
+        const ramp = CameraController.TOUCH_RESUME_RAMP;
+        if (!(ramp > 0)) {
+            return 1;
+        }
+        return Math.min((idle - delay) / ramp, 1);
+    }
+
+    /**
+     * Back to the framing the scenario published ("Recentrar"). A no-op off
+     * the fixed view, so the button can be wired unconditionally.
+     */
+    resetFixedView() {
+        const view = this.fixedView;
+        const home = this._fixedHome;
+        if (!view || !home) {
+            return this;
+        }
+        view.distance = home.distance;
+        view.elevation = home.elevation;
+        this._fixedAzimuth = home.azimuth * Math.PI / 180;
+        this._fixedPan.set(0, 0, 0);
+        // Let the drift fade back in rather than restart mid-frame.
+        this._touchIdle = 0;
+        this._emitFixedDistance(true);
+        this._applyFixedView(0, true);
+        return this;
+    }
+
+    /**
+     * preventDefault() for a touch pointer: without it the page scrolls (and
+     * on iOS rubber-bands) underneath the simulation. Mouse pointers are left
+     * alone so focus and the context menu behave normally.
+     */
+    static preventTouchDefault(event) {
+        if (!event || event.pointerType === 'mouse') {
+            return;
+        }
+        if (event.cancelable !== false && typeof event.preventDefault === 'function') {
+            try { event.preventDefault(); } catch (e) { /* ignore */ }
+        }
     }
 
     // -----------------------------------------------------------------------

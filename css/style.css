@@ -1694,11 +1694,12 @@ body.nv-armed canvas {
    window size on a desktop browser and so the two never disagree with the
    JavaScript about which build is running.
 
-   There are no camera controls on a phone: each scenario is shown from a fixed
-   viewpoint of its own. So everything that exists to act on the camera or on a
-   body - the body list, the inspector, the orbit controls, the "Adicionar
-   corpo" tool, the playback bar and the keyboard help - is hidden outright
-   rather than shrunk, and what is left is a read-only strip plus two buttons.
+   Each scenario is shown from a viewpoint of its own, which the user can turn
+   with one finger and pinch with two but not fly around. So everything that
+   exists to act on the camera or on a body - the body list, the inspector, the
+   orbit controls, the "Adicionar corpo" tool, the playback bar and the keyboard
+   help - is hidden outright rather than shrunk, and what is left is a read-only
+   strip plus three buttons.
    ========================================================================== */
 
 body.nv-mobile .nv-hud,
@@ -1715,6 +1716,25 @@ body.nv-mobile .nv-crosshair {
    every tap makes the buttons feel broken */
 body.nv-mobile {
     -webkit-tap-highlight-color: transparent;
+    /* no pull-to-refresh and no rubber-banding while a finger turns the view */
+    overscroll-behavior: none;
+}
+
+/* The canvas owns every touch gesture over it: `touch-action: none` is what
+   makes the browser keep sending pointermove instead of claiming the gesture
+   for a scroll or a pinch-zoom and firing pointercancel halfway through.
+   preventDefault() alone is NOT enough - Chrome ignores it for a pointer whose
+   touch-action still allows panning.
+
+   OrbitControls sets the same thing as an INLINE style in its constructor, so
+   this is insurance rather than the only line of defence: it survives the
+   controls being disposed and says out loud why the canvas must not scroll.
+   Desktop is untouched - the rule is keyed off body.nv-mobile, like the rest
+   of this section. */
+body.nv-mobile canvas {
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
 }
 
 .nv-root--mobile {
@@ -1790,7 +1810,7 @@ body.nv-mobile {
     color: var(--nv-text);
 }
 
-/* --- the two buttons, bottom of the screen ------------------------------ */
+/* --- the three buttons, bottom of the screen ---------------------------- */
 
 .nv-root--mobile .nv-mobile-bar {
     position: absolute;
@@ -1803,8 +1823,12 @@ body.nv-mobile {
 
 .nv-mobile-bar__button {
     flex: 1 1 0;
+    min-width: 0;              /* three of them still fit a 320 px screen */
     min-height: 48px;          /* a thumb, not a mouse pointer */
-    font-size: 14px;
+    padding-left: 6px;
+    padding-right: 6px;
+    white-space: nowrap;
+    font-size: 13px;
     border-radius: var(--nv-radius);
     box-shadow: var(--nv-shadow);
     backdrop-filter: blur(14px) saturate(140%);

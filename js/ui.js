@@ -136,6 +136,9 @@ class NavigatorUI {
      *   onOrbitModeChange {Function} ('none'|'ellipses'|'trails'|'both') => void
      *   onOrbitScopeChange {Function} ('selected'|'top12'|'top48'|'all') => void
      *   onChangeScenario {Function} () => void                back to the launch screen
+     *   onRecenter     {Function} () => void                 mobile: restore the
+     *                  framing meta.mobileView asked for, after the user has
+     *                  turned or pinched it
      *   onSpawnArm     {Function} (armed) => void            ferramenta armada / desarmada
      *   onSpawnConfigChange {Function} (config) => void      type / mass / composition / velocity
      *   onSpawnUndo    {Function} () => void                 remove the last body created
@@ -168,6 +171,7 @@ class NavigatorUI {
         this.onOrbitModeChange = options.onOrbitModeChange || null;
         this.onOrbitScopeChange = options.onOrbitScopeChange || null;
         this.onChangeScenario = options.onChangeScenario || null;
+        this.onRecenter = options.onRecenter || null;
         this.onSpawnArm = options.onSpawnArm || null;
         this.onSpawnConfigChange = options.onSpawnConfigChange || null;
         this.onSpawnUndo = options.onSpawnUndo || null;
@@ -1649,11 +1653,13 @@ class NavigatorUI {
         return overlay;
     }
 
-    // --- mobile: a read-only strip and two buttons -------------------------
+    // --- mobile: a read-only strip and three buttons -----------------------
     //
     // What survives on a phone: which scenario is running, how much time it has
-    // simulated, how many bodies are left, pause, and the way back to the
-    // scenario picker. Everything else needs a camera the user cannot move.
+    // simulated, how many bodies are left, pause, "Recentrar" (the camera is
+    // semi-fixed but the user can turn and pinch it) and the way back to the
+    // scenario picker. Everything else needs a camera and a pointer this build
+    // does not have.
 
     _buildMobileTop() {
         const strip = document.createElement('div');
@@ -1719,6 +1725,19 @@ class NavigatorUI {
         });
         this.mobilePauseButton = pause;
         bar.appendChild(pause);
+
+        // One finger turns the fixed view and two pinch it, so there has to be
+        // a way back to the framing the scenario chose.
+        const recenter = document.createElement('button');
+        recenter.type = 'button';
+        recenter.className = 'nv-button nv-mobile-bar__button';
+        recenter.textContent = 'Recentrar';
+        recenter.addEventListener('click', function () {
+            if (self.onRecenter) { self.onRecenter(); }
+            self._blur(recenter);
+        });
+        this.mobileRecenterButton = recenter;
+        bar.appendChild(recenter);
 
         const swap = document.createElement('button');
         swap.type = 'button';
