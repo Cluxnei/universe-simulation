@@ -899,11 +899,161 @@ function scenarioExtent(bodies){
     return extent
 }
 
+// --- Mobile framing -----------------------------------------------------------
+
+/**
+ * ON A PHONE THERE IS NO CAMERA TO FLY. Orbit-drag, free-fly and pointer lock
+ * are all worth nothing on a touch screen held in one hand, so the mobile build
+ * drops them and each scenario instead ships ONE FIXED FRAMING that has to read
+ * on its own, without a single gesture, for the minute or two somebody will
+ * actually look at it. That framing is `meta.mobileView`:
+ *
+ *     distance    AU from the target
+ *     elevation   degrees above the disk plane (the xz-plane, normal +y)
+ *     azimuth     degrees around that normal
+ *     target      world point to look at, or null for the origin
+ *     autoRotate  degrees of azimuth per REAL second (not per simulated year)
+ *     follow      null | 'dominant' (heaviest star/hole) | 'largest' (heaviest
+ *                 body of any kind); both re-target as bodies merge
+ *
+ * The camera the numbers below are computed against is
+ *
+ *     eye = target + distance * (cos(el)cos(az), sin(el), cos(el)sin(az))
+ *
+ * looking at `target` with +y up, WITH A 70 DEGREE VERTICAL FIELD OF VIEW ON A
+ * 9:16 PORTRAIT SCREEN. That last part is not a detail: portrait means the
+ * NARROW axis is the horizontal one, whose half-angle is only
+ * atan(tan(35 deg) * 9/16) = 21.5 degrees, so a disk that fits vertically can
+ * still hang out of both sides. Every distance here is sized against that
+ * narrow axis and nothing else. A consumer that renders with a different field
+ * of view or aspect must rescale by tan(fov/2)*aspect / 0.3939 or the framings
+ * are wrong by that ratio.
+ */
+const SCENARIO_MOBILE_FOV = 70                          // degrees, VERTICAL
+const SCENARIO_MOBILE_ASPECT = 9 / 16                   // portrait, width/height
+const SCENARIO_MOBILE_HALF_WIDTH =
+    Math.tan(SCENARIO_MOBILE_FOV * Math.PI / 360) * SCENARIO_MOBILE_ASPECT   // 0.3939
+
+const SCENARIO_MOBILE_MIN_DISTANCE = 0.05               // AU
+const SCENARIO_MOBILE_MAX_DISTANCE = 1e9                // AU
+
+/**
+ * Distance at which a sphere of `radius` around the target exactly fills the
+ * narrow (horizontal) screen axis, times `margin` of headroom for whatever the
+ * system does in the minutes after t = 0.
+ *
+ * Everything in this file that picks a distance picks it here, from a length
+ * the builder already computed - a disk edge, a cluster radius, a measured
+ * extent - so the framing follows the parameters instead of being a constant
+ * that happens to suit the defaults.
+ */
+function scenarioMobileDistance(radius, margin){
+    const safeRadius = isFinite(radius) && radius > 0 ? radius : 0
+    const safeMargin = isFinite(margin) && margin > 0 ? margin : 1
+    return scenarioClamp(safeRadius * safeMargin / SCENARIO_MOBILE_HALF_WIDTH,
+        SCENARIO_MOBILE_MIN_DISTANCE, SCENARIO_MOBILE_MAX_DISTANCE)
+}
+
+/**
+ * cos(45 deg). The encounter scenarios lay their two clumps out along the x
+ * axis and are framed from 45 degrees to it, so only this much of the
+ * separation lands on the narrow screen axis and the rest becomes depth - which
+ * is worth a third off the distance, and is also the only way to see two bodies
+ * approach each other rather than one hiding behind the other.
+ */
+const SCENARIO_MOBILE_DIAGONAL = Math.SQRT1_2
+
+/**
+ * Radius to frame for a pair laid out on one axis: the separation is
+ * foreshortened by the diagonal view, the clumps hanging off each end are not.
+ */
+function scenarioMobileEncounterRadius(halfSeparation, clumpRadius){
+    const half = isFinite(halfSeparation) && halfSeparation > 0 ? halfSeparation : 0
+    const clump = isFinite(clumpRadius) && clumpRadius > 0 ? clumpRadius : 0
+    return SCENARIO_MOBILE_DIAGONAL * half + clump
+}
+
+const SCENARIO_MOBILE_FOLLOW_MODES = ['dominant', 'largest']
+
+/**
+ * Every field of the contract, present and finite, whatever the scenario chose
+ * to leave out. `fallback` is the distance to use when a scenario returns none
+ * at all - the desktop camera distance, which is always right to within a
+ * factor of two.
+ */
+function scenarioNormalizeMobileView(view, fallback){
+    const source = view || {}
+    const backup = isFinite(fallback) && fallback > 0 ? fallback : 40
+    const distance = isFinite(source.distance) && source.distance > 0
+        ? scenarioClamp(source.distance, SCENARIO_MOBILE_MIN_DISTANCE, SCENARIO_MOBILE_MAX_DISTANCE)
+        : backup
+    let target = null
+    if(source.target && isFinite(source.target.x) && isFinite(source.target.y) && isFinite(source.target.z))
+        target = { x: source.target.x, y: source.target.y, z: source.target.z }
+    let follow = null
+    for(let i = 0; i < SCENARIO_MOBILE_FOLLOW_MODES.length; i++){
+        if(source.follow === SCENARIO_MOBILE_FOLLOW_MODES[i])
+            follow = source.follow
+    }
+    // Defaulted BEFORE clamping: scenarioClamp() answers `min` for anything
+    // that is not finite, so an omitted elevation would come back as -89 and
+    // put the camera under the disk.
+    let elevation = Number(source.elevation)
+    if(!isFinite(elevation)) elevation = 28
+    let azimuth = Number(source.azimuth)
+    if(!isFinite(azimuth)) azimuth = 35
+    // Wrapped rather than clamped: any azimuth is legal, and an unwrapped one
+    // would make autoRotate's accumulated angle grow without bound.
+    azimuth = ((azimuth % 360) + 360) % 360
+    return {
+        distance,
+        elevation: scenarioClamp(elevation, -89, 89),
+        azimuth,
+        target,
+        autoRotate: isFinite(Number(source.autoRotate))
+            ? scenarioClamp(Number(source.autoRotate), -30, 30) : 0,
+        follow
+    }
+}
+
 // --- Parameter plumbing -------------------------------------------------------
 
+/**
+ * Whether the page is running its mobile build.
+ *
+ * Read AT BUILD TIME and off `window`, never as a bare identifier: main.js
+ * declares `mobileMode` as a top-level `let` and is loaded AFTER this file, so
+ * a bare reference here would sit in the temporal dead zone and throw - and
+ * `typeof` would throw with it, which is exactly the case `typeof` is normally
+ * trusted to survive. It is also read per call rather than cached, because the
+ * flag flips when the window is resized across the breakpoint. In node, where
+ * there is no window at all, this is simply false and every scenario builds its
+ * desktop self.
+ */
+function scenarioMobileMode(){
+    return typeof window !== 'undefined' && window.mobileMode === true
+}
+
+/**
+ * A parameter's default, which on a phone is not the same number.
+ *
+ * BODY COUNT IS THE COST. Everything else the mobile build does - fewer
+ * lights, coarser meshes, a capped pixel ratio - is a constant factor, but the
+ * force loop is what actually decides whether the thing runs at all, so the
+ * scenarios that ship hundreds of embryos ship a third as many when the page is
+ * a phone. It is applied as a DEFAULT and not as a cap: a value the user typed
+ * into the picker still wins, in both directions.
+ */
+function scenarioParamDefault(spec){
+    if(spec.mobileDefault !== undefined && scenarioMobileMode())
+        return spec.mobileDefault
+    return spec.default
+}
+
 function scenarioCoerceParam(spec, raw){
+    const fallback = scenarioParamDefault(spec)
     if(spec.type === 'bool'){
-        if(raw === undefined || raw === null) return !!spec.default
+        if(raw === undefined || raw === null) return !!fallback
         if(typeof raw === 'string')
             return raw !== '' && raw !== 'false' && raw !== '0' && raw !== 'nao' && raw !== 'não'
         return !!raw
@@ -913,14 +1063,14 @@ function scenarioCoerceParam(spec, raw){
         for(let i = 0; i < choices.length; i++){
             if(choices[i].value === raw) return raw
         }
-        return spec.default
+        return fallback
     }
     let value = Number(raw)
-    if(!isFinite(value)) value = spec.default
+    if(!isFinite(value)) value = fallback
     if(spec.type === 'int') value = Math.round(value)
     if(typeof spec.min === 'number' && value < spec.min) value = spec.min
     if(typeof spec.max === 'number' && value > spec.max) value = spec.max
-    if(!isFinite(value)) value = spec.default
+    if(!isFinite(value)) value = fallback
     return value
 }
 
@@ -981,6 +1131,8 @@ const SCENARIO_PLANETARY_SYSTEM = {
         {
             key: 'bodyCount', label: 'Número de corpos', type: 'int',
             default: PLANETS_NUMBER, min: 0, max: 4000, step: 10,
+            mobileDefault: (typeof PLANETS_NUMBER_MOBILE === 'number')
+                ? PLANETS_NUMBER_MOBILE : 220,
             help: 'Embriões no disco. Mais corpos, mais colisões e menos quadros por segundo.'
         },
         {
@@ -1025,6 +1177,24 @@ const SCENARIO_PLANETARY_SYSTEM = {
                 fusion: true,
                 gasInnerRadius: inner,
                 gasOuterRadius: outer,
+                // The disk is the subject and it does not go anywhere: it is
+                // still the same 20 AU across at t = 200 yr as at t = 0, so the
+                // outer edge is the whole framing problem. 6% of headroom
+                // covers the embryos that scattering pushes just outside it.
+                mobileView: {
+                    distance: scenarioMobileDistance(outer, 1.06),
+                    // Enough tilt to see it as a disk and not as a line, not so
+                    // much that it flattens into a target seen from the pole.
+                    elevation: 28,
+                    azimuth: 35,
+                    target: null,
+                    // The inner embryos orbit several times a minute, so the
+                    // scene reads as three-dimensional without much help.
+                    autoRotate: 1,
+                    follow: 'dominant'
+                },
+                mobileNotes: 'Câmera fixa sobre o disco inteiro; os embriões ' +
+                    'internos dão várias voltas por minuto.',
                 notes: 'Linha de gelo em ' +
                     Composition.snowLineRadius(star.effectiveTemperature, star.radius).toFixed(2) +
                     ' UA. Dentro dela os corpos são secos; fora, gelados.'
@@ -1083,7 +1253,7 @@ const SCENARIO_BINARY_STAR = {
         },
         {
             key: 'bodyCount', label: 'Corpos no disco', type: 'int',
-            default: 600, min: 0, max: 4000, step: 10
+            default: 600, min: 0, max: 4000, step: 10, mobileDefault: 180
         },
         {
             key: 'diskWidth', label: 'Largura do disco', type: 'float',
@@ -1162,6 +1332,23 @@ const SCENARIO_BINARY_STAR = {
                 fusion: true,
                 gasInnerRadius: inner,
                 gasOuterRadius: outer,
+                // With a disk the disk is the subject; without one the pair is,
+                // and then twice the apoapsis puts both stars comfortably on
+                // screen with room for the orbit around them.
+                mobileView: {
+                    distance: scenarioMobileDistance(
+                        (p.disk && p.bodyCount > 0) ? outer : 2 * apoapsis, 1.05),
+                    elevation: 30,
+                    azimuth: 20,
+                    target: null,
+                    // Never 'dominant' here: the primary swings around the
+                    // barycentre every binary period and a camera glued to it
+                    // would throw the whole disk from side to side.
+                    autoRotate: 1,
+                    follow: null
+                },
+                mobileNotes: 'As duas estrelas ficam no centro do quadro; o ' +
+                    'disco começa fora da cavidade que elas mantêm limpa.',
                 notes
             }
         }
@@ -1222,7 +1409,7 @@ const SCENARIO_STELLAR_COLLISION = {
         },
         {
             key: 'bodiesPerDisk', label: 'Corpos por disco', type: 'int',
-            default: 200, min: 0, max: 2000, step: 10
+            default: 200, min: 0, max: 2000, step: 10, mobileDefault: 60
         },
         {
             key: 'diskOuterRadius', label: 'Raio externo dos discos', type: 'float',
@@ -1313,6 +1500,32 @@ const SCENARIO_STELLAR_COLLISION = {
                 fusion: true,
                 gasInnerRadius: inner,
                 gasOuterRadius: p.diskOuterRadius,
+                // THE ENCOUNTER HAPPENS AT THE ORIGIN, not where the stars
+                // start: the pair is built in its own centre-of-momentum frame,
+                // so the barycentre never moves and the merger occurs exactly
+                // at the centre of the frame. Framing on the starting positions
+                // is therefore also framing on the collision - which is why the
+                // target stays null and nothing is followed.
+                mobileView: {
+                    distance: scenarioMobileDistance(
+                        scenarioMobileEncounterRadius(
+                            Math.hypot(rx, rz) * Math.max(massA, massB) / total,
+                            (p.disks && p.bodiesPerDisk > 0) ? p.diskOuterRadius : 0),
+                        // Generous, because the merger throws the two stripped
+                        // disks outward and that debris is half the show.
+                        1.2),
+                    elevation: 25,
+                    // 45 degrees to the approach axis: the stars cross the
+                    // frame diagonally instead of one sitting behind the other.
+                    azimuth: 45,
+                    target: null,
+                    // The approach is the fastest motion in the file. Adding
+                    // camera rotation to it would only fight it.
+                    autoRotate: 0,
+                    follow: null
+                },
+                mobileNotes: 'As duas estrelas se encontram no centro do ' +
+                    'quadro; os discos são arrancados na passagem.',
                 notes: encounterNotes
             }
         }
@@ -1331,7 +1544,7 @@ const SCENARIO_CLUSTER = {
     params: [
         {
             key: 'starCount', label: 'Número de estrelas', type: 'int',
-            default: 60, min: 2, max: 400, step: 1
+            default: 60, min: 2, max: 400, step: 1, mobileDefault: 24
         },
         {
             key: 'totalMass', label: 'Massa total', type: 'float',
@@ -1593,6 +1806,28 @@ const SCENARIO_CLUSTER = {
                 diskNormal: null,
                 gasAccretion: false,
                 fusion: true,
+                // The sphere is drawn out to p.radius and, at the virial ratio
+                // of 1 it is built with, it stays about that size: the crossing
+                // time is 516 yr for the defaults and a viewer sees at most a
+                // couple of hundred. 5% of headroom covers the stars a close
+                // encounter kicks out early.
+                mobileView: {
+                    distance: scenarioMobileDistance(p.radius, 1.05),
+                    // A sphere has no plane, so this is pure composition: a low
+                    // tilt keeps the +y axis from reading as a pole.
+                    elevation: 20,
+                    azimuth: 0,
+                    target: null,
+                    // The one scenario that really needs the camera to move:
+                    // over a minute a star covers only a tenth of its orbit, so
+                    // without rotation the cluster reads as a flat spray of
+                    // points. Two degrees per second is a third of a turn per
+                    // minute - enough for parallax, slow enough not to swim.
+                    autoRotate: 2,
+                    follow: null
+                },
+                mobileNotes: 'A câmera gira devagar em torno do aglomerado: é ' +
+                    'a rotação que revela que ele é uma esfera, e não um borrão.',
                 notes
             }
         }
@@ -1645,7 +1880,7 @@ const SCENARIO_SYSTEM_COLLISION = {
         },
         {
             key: 'bodiesPerSystem', label: 'Corpos por sistema', type: 'int',
-            default: 300, min: 0, max: 2000, step: 10
+            default: 300, min: 0, max: 2000, step: 10, mobileDefault: 90
         },
         {
             key: 'diskOuterRadius', label: 'Raio externo dos discos', type: 'float',
@@ -1713,6 +1948,24 @@ const SCENARIO_SYSTEM_COLLISION = {
                 fusion: true,
                 gasInnerRadius: inner,
                 gasOuterRadius: p.diskOuterRadius,
+                // Same construction as the stellar collision and the same
+                // consequence: the passage happens at the origin, so one static
+                // frame holds both the starting configuration and the encounter
+                // - which with the defaults arrives around 20 yr, a minute in.
+                mobileView: {
+                    distance: scenarioMobileDistance(
+                        scenarioMobileEncounterRadius(
+                            Math.hypot(rx, rz) * Math.max(massA, massB) / total,
+                            perSystem > 0 ? p.diskOuterRadius : 0),
+                        1.2),
+                    elevation: 25,
+                    azimuth: 45,
+                    target: null,
+                    autoRotate: 0,
+                    follow: null
+                },
+                mobileNotes: 'Os dois sistemas se cruzam no centro do quadro ' +
+                    'depois de cerca de um minuto de observação.',
                 notes: 'As estrelas passam a ' + periapsis.toFixed(2) + ' UA uma da outra ' +
                     'por volta de ' + encounterTime.toFixed(1) + ' anos. Discos de ' +
                     p.diskOuterRadius.toFixed(1) + ' UA: tudo além do periastro é arrancado.'
@@ -1763,7 +2016,7 @@ const SCENARIO_RANDOM = {
         },
         {
             key: 'bodyCount', label: 'Planetesimais', type: 'int',
-            default: 500, min: 0, max: 4000, step: 10
+            default: 500, min: 0, max: 4000, step: 10, mobileDefault: 150
         },
         {
             key: 'diskMass', label: 'Massa em planetesimais', type: 'float',
@@ -1946,6 +2199,32 @@ const SCENARIO_RANDOM = {
                 fusion: true,
                 gasInnerRadius: inner,
                 gasOuterRadius: spread,
+                // `spread` as well as the measured extent, because with one
+                // star and no planetesimals the extent is zero and the user
+                // still asked for a system that big.
+                //
+                // The 25% of headroom is the largest in the file and it is not
+                // enough on its own: with several stars this is a small cluster
+                // that scatters bodies out of any fixed frame within a couple
+                // of hundred years. Measured on the default three-star draw,
+                // 100% of the bodies are in frame at t = 0 and about two thirds
+                // at t = 60 yr - the missing third has genuinely been ejected,
+                // and no distance short of losing the system to a dot fixes it.
+                mobileView: {
+                    distance: scenarioMobileDistance(Math.max(extent, spread), 1.25),
+                    // The sphere layout has no plane to tilt against; the disk
+                    // layout is flattened 20:1 and needs the same tilt as any
+                    // other disk here.
+                    elevation: sphere ? 20 : 30,
+                    azimuth: 30,
+                    target: null,
+                    autoRotate: sphere ? 2 : 1,
+                    follow: null
+                },
+                mobileNotes: sphere
+                    ? 'Esfera isotrópica vista de fora, com a câmera girando devagar.'
+                    : 'Enquadramento fixo sobre toda a extensão pedida; com ' +
+                      'várias estrelas o sistema se espalha em poucas dezenas de anos.',
                 notes: p.starCount + (p.starCount === 1 ? ' estrela' : ' estrelas') +
                     ' e ' + p.bodyCount + ' planetesimais, ' +
                     (sphere ? 'em esfera' : 'em disco') + ', até ' + spread.toFixed(0) + ' UA.' +
@@ -2088,6 +2367,18 @@ const SCENARIO_GALACTIC_CENTER = {
             suggestedDt = orbitalPeriod(inner, holeMass) / SCENARIO_STEPS_PER_STELLAR_ORBIT
         suggestedDt = scenarioClamp(suggestedDt, SCENARIO_MIN_DT, SCENARIO_MAX_DT)
         const extent = scenarioExtent(bodies)
+        // MEAN APOAPSIS, not the extent, is what the phone frame is sized on.
+        // The extent is whatever the single most eccentric star happened to be
+        // doing when the draw was made: it swings by a factor of three between
+        // seeds and would make the framing lurch from run to run. The mean of
+        // a*(1+e) over the orbits that were actually built is stable, and it is
+        // the radius the cluster genuinely occupies - the handful of stars
+        // outside it are near apoapsis, which is where they move slowest and
+        // matter least.
+        let apoapsisSum = 0
+        for(let i = 0; i < orbits.length; i++)
+            apoapsisSum += orbits[i].a * (1 + orbits[i].e)
+        const meanApoapsis = orbits.length > 0 ? apoapsisSum / orbits.length : outer
         let notes = 'Horizonte de eventos: ' + scenarioFormatLength(horizon) + ' UA' +
             (horizon < SOFTENING
                 ? ' - ABAIXO do comprimento de suavização (' + SOFTENING + ' UA), ' +
@@ -2112,6 +2403,28 @@ const SCENARIO_GALACTIC_CENTER = {
                 diskNormal: null,
                 gasAccretion: false,
                 fusion: true,
+                // Slow enough for a static frame: S2 takes 16 yr to close its
+                // orbit and the simulation delivers about a third of a year per
+                // real second here, so a viewer sees a quarter of one orbit a
+                // minute. Nothing needs chasing.
+                mobileView: {
+                    distance: scenarioMobileDistance(meanApoapsis, 1.0),
+                    // The S cluster is isotropic - there is no disk plane to
+                    // respect - so the tilt is chosen to put the orbits at an
+                    // angle rather than edge-on to any of them.
+                    elevation: 25,
+                    azimuth: 0,
+                    target: null,
+                    // The hole holds essentially all the mass, so this is the
+                    // origin to a part in 1e5. It is asked for anyway so that
+                    // the frame stays on the hole if a star is ever swallowed
+                    // and the barycentre shifts.
+                    autoRotate: 1.5,
+                    follow: 'dominant'
+                },
+                mobileNotes: 'O buraco negro fica parado no centro; as ' +
+                    'estrelas disparam ao passar pelo periastro e quase param ' +
+                    'no apoastro.',
                 notes
             }
         }
@@ -2154,7 +2467,7 @@ const SCENARIO_BLACK_HOLE_BINARY = {
         },
         {
             key: 'bodyCount', label: 'Corpos no disco', type: 'int',
-            default: 500, min: 0, max: 4000, step: 10
+            default: 500, min: 0, max: 4000, step: 10, mobileDefault: 150
         },
         {
             key: 'diskWidth', label: 'Largura do disco', type: 'float',
@@ -2253,6 +2566,24 @@ const SCENARIO_BLACK_HOLE_BINARY = {
                 fusion: false,
                 gasInnerRadius: inner,
                 gasOuterRadius: outer,
+                // The disk is stationary in size and the pair is a 2.3 yr clock
+                // at the middle of it, so this is the easiest framing here: put
+                // the whole disk on screen and leave it alone.
+                mobileView: {
+                    distance: scenarioMobileDistance(
+                        (p.disk && p.bodyCount > 0) ? outer : 2 * apoapsis, 1.02),
+                    // Steeper than the other disks on purpose: THE SUBJECT IS A
+                    // HOLE. The cavity the pair scours out only reads as a
+                    // cavity from well above the plane - at 25 degrees it is a
+                    // gap in a line.
+                    elevation: 36,
+                    azimuth: 20,
+                    target: null,
+                    autoRotate: 0.8,
+                    follow: null
+                },
+                mobileNotes: 'Os dois buracos negros são invisíveis: o que se ' +
+                    'vê é a cavidade que eles abrem no meio do disco.',
                 notes
             }
         }
@@ -2411,6 +2742,43 @@ const SCENARIO_TIDAL_DISRUPTION = {
                 diskNormal: { x: 0, y: 1, z: 0 },
                 gasAccretion: false,
                 fusion: true,
+                // THE WORST DYNAMIC RANGE IN THE FILE, and the one framing here
+                // that is a genuine compromise rather than a fit.
+                //
+                // With the defaults the star is launched from 18.6 AU, is torn
+                // apart at 0.23 AU after 0.0061 yr, and the stream then walks
+                // outward at a steady ~1400 AU/yr. The simulation runs this at
+                // 8.8e-4 yr per real second, so what a viewer actually gets is:
+                // the plunge over the first 7 seconds, the disruption at 7-8
+                // seconds, and then a stream whose radius is 22 AU at 15 s,
+                // 49 AU at 30 s, 94 AU at 60 s and 175 AU at two minutes. No
+                // single distance holds all of that.
+                //
+                // Five times the launch distance is where the two halves of the
+                // scenario cost each other least: the infalling star is still a
+                // fifth of the way out from the centre at t = 0 - clearly a
+                // separate object and clearly moving - and the stream stays
+                // whole until about a minute in, which is a whole minute of the
+                // thing the scenario is named after. Framing the plunge alone
+                // (about 45 AU) empties the frame four seconds after the
+                // disruption; framing the two-minute stream (about 450 AU)
+                // makes the first eight seconds two dots that never separate.
+                mobileView: {
+                    distance: scenarioMobileDistance(5 * distance, 1.0),
+                    elevation: 30,
+                    // The plunge comes in along x; 45 degrees to it shows the
+                    // approach and then the stream fanning across the frame.
+                    azimuth: 45,
+                    target: null,
+                    // The hole is 1e6 times the star: it is the origin, and it
+                    // stays the origin as it eats. Following it costs nothing
+                    // and guarantees the centre of the frame is the centre of
+                    // the event even for a hole only a few times the star.
+                    autoRotate: 0,
+                    follow: 'dominant'
+                },
+                mobileNotes: 'A estrela é despedaçada nos primeiros segundos; ' +
+                    'o que continua na tela é o rastro de destroços se abrindo.',
                 notes
             }
         }
@@ -2455,7 +2823,7 @@ const SCENARIO_ROGUE_BLACK_HOLE = {
         },
         {
             key: 'bodyCount', label: 'Corpos no disco', type: 'int',
-            default: 600, min: 0, max: 4000, step: 10
+            default: 600, min: 0, max: 4000, step: 10, mobileDefault: 180
         },
         {
             key: 'diskInnerRadius', label: 'Raio interno do disco', type: 'float',
@@ -2541,6 +2909,34 @@ const SCENARIO_ROGUE_BLACK_HOLE = {
                 fusion: true,
                 gasInnerRadius: inner,
                 gasOuterRadius: outer,
+                // The hole carries ten times the star's mass, so the barycentre
+                // - and the origin - sits almost on top of the HOLE, and the
+                // star with its disk starts 182 AU away on the far side. Both
+                // of them arrive at the origin at the encounter, around 35 yr,
+                // which is 35 seconds in at the timestep this scenario runs at,
+                // so a frame that holds the star's starting position also holds
+                // the encounter and there is no reason to follow anything.
+                //
+                // Nothing is followed for a second reason: neither follow mode
+                // can name the HOST STAR here. 'dominant' and 'largest' both
+                // resolve to the black hole, which is the one body in the scene
+                // that is invisible.
+                mobileView: {
+                    distance: scenarioMobileDistance(
+                        scenarioMobileEncounterRadius(
+                            Math.hypot(rx, rz) * holeMass / total, outer), 1.2),
+                    elevation: 26,
+                    azimuth: 45,
+                    target: null,
+                    // Zero, and deliberately: after the passage the star leaves
+                    // the frame along +x, and a rotating camera would swing
+                    // that axis onto the narrow side of the screen and lose it
+                    // sooner.
+                    autoRotate: 0,
+                    follow: null
+                },
+                mobileNotes: 'O buraco negro não se vê chegando: o que aparece ' +
+                    'é o disco sendo puxado e espalhado quando ele passa.',
                 notes
             }
         }
@@ -2571,14 +2967,23 @@ function getScenario(id){
     return null
 }
 
-/** Every parameter of a scenario at its default. Safe to hand straight to build(). */
+/**
+ * Every parameter of a scenario at its default. Safe to hand straight to
+ * build().
+ *
+ * This goes through scenarioParamDefault() rather than reading spec.default,
+ * and it has to: the picker seeds itself from here and then hands build() every
+ * parameter EXPLICITLY, so a mobile default that only existed inside
+ * scenarioCoerceParam() would be overwritten by the desktop number before it
+ * was ever used, and the phone would quietly get all 800 embryos.
+ */
 function scenarioDefaults(id){
     const descriptor = getScenario(id)
     const defaults = {}
     if(!descriptor) return defaults
     const specs = descriptor.params || []
     for(let i = 0; i < specs.length; i++)
-        defaults[specs[i].key] = specs[i].default
+        defaults[specs[i].key] = scenarioParamDefault(specs[i])
     return defaults
 }
 
@@ -2611,6 +3016,11 @@ function buildScenario(id, params){
                 ? meta.gasInnerRadius : DISK_INNER_RADIUS,
             gasOuterRadius: isFinite(meta.gasOuterRadius) && meta.gasOuterRadius > 0
                 ? meta.gasOuterRadius : DISK_OUTER_RADIUS,
+            // The fixed framing the mobile build uses in place of a camera the
+            // user can fly. Normalised here for the same reason everything else
+            // is: the consumer must never have to test for a missing field.
+            mobileView: scenarioNormalizeMobileView(meta.mobileView, meta.cameraDistance),
+            mobileNotes: meta.mobileNotes || '',
             notes: meta.notes || ''
         }
     }

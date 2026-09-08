@@ -141,6 +141,7 @@ class NavigatorUI {
      *   onSpawnUndo    {Function} () => void                 remove the last body created
      *   maxRows        {number}   default 60
      *   refreshInterval{number}   seconds, default 0.25
+     *   mobile         {boolean}  reduce to the read-only strip + bar
      */
     constructor(options) {
         options = options || {};
@@ -173,6 +174,18 @@ class NavigatorUI {
 
         this.maxRows = options.maxRows || 60;
         this.refreshInterval = options.refreshInterval || 0.25;
+
+        // MOBILE. There are no camera controls on a phone, so most of this
+        // panel has nothing to act on: the body list, the inspector, the orbit
+        // controls, the spawn tool, the playback bar and the keyboard help are
+        // all hidden (by CSS - the nodes are still built, so every setter here
+        // keeps working and the mode can be flipped at runtime) and replaced by
+        // a read-only strip and two buttons. The expensive refresh work is
+        // SKIPPED rather than merely hidden: see refresh().
+        this.mobile = !!options.mobile;
+        this._mobileTimeLast = null;
+        this._mobileCountLast = null;
+        this._mobileNote = '';
 
         // --- state ---------------------------------------------------------
         this.selected = null;
@@ -327,7 +340,12 @@ class NavigatorUI {
         root.appendChild(this._buildPlayback());
         root.appendChild(this._buildHelp());
         root.appendChild(this._buildCrosshair());
+        // Always built, shown only under .nv-root--mobile, so setMobile() is a
+        // class toggle rather than a DOM rebuild.
+        root.appendChild(this._buildMobileTop());
+        root.appendChild(this._buildMobileBar());
         root.appendChild(this._buildToasts());
+        root.classList.toggle('nv-root--mobile', this.mobile);
 
         this.mount.appendChild(root);
     }
@@ -1631,6 +1649,92 @@ class NavigatorUI {
         return overlay;
     }
 
+    // --- mobile: a read-only strip and two buttons -------------------------
+    //
+    // What survives on a phone: which scenario is running, how much time it has
+    // simulated, how many bodies are left, pause, and the way back to the
+    // scenario picker. Everything else needs a camera the user cannot move.
+
+    _buildMobileTop() {
+        const strip = document.createElement('div');
+        strip.className = 'nv-mobile-top';
+
+        const name = document.createElement('p');
+        name.className = 'nv-mobile-top__name';
+        name.textContent = 'Simulação';
+        this.mobileName = name;
+        strip.appendChild(name);
+
+        const note = document.createElement('p');
+        note.className = 'nv-mobile-top__note nv-hidden';
+        this.mobileNote = note;
+        strip.appendChild(note);
+
+        const stats = document.createElement('div');
+        stats.className = 'nv-mobile-top__stats';
+
+        const timeBlock = document.createElement('div');
+        timeBlock.className = 'nv-mobile-stat';
+        const timeLabel = document.createElement('span');
+        timeLabel.className = 'nv-mobile-stat__label';
+        timeLabel.textContent = 'Tempo simulado';
+        const timeValue = document.createElement('span');
+        timeValue.className = 'nv-mobile-stat__value';
+        timeValue.textContent = '—';
+        this.mobileTime = timeValue;
+        timeBlock.appendChild(timeLabel);
+        timeBlock.appendChild(timeValue);
+        stats.appendChild(timeBlock);
+
+        const countBlock = document.createElement('div');
+        countBlock.className = 'nv-mobile-stat';
+        const countLabel = document.createElement('span');
+        countLabel.className = 'nv-mobile-stat__label';
+        countLabel.textContent = 'Corpos';
+        const countValue = document.createElement('span');
+        countValue.className = 'nv-mobile-stat__value';
+        countValue.textContent = '—';
+        this.mobileCount = countValue;
+        countBlock.appendChild(countLabel);
+        countBlock.appendChild(countValue);
+        stats.appendChild(countBlock);
+
+        strip.appendChild(stats);
+        this.mobileTop = strip;
+        return strip;
+    }
+
+    _buildMobileBar() {
+        const bar = document.createElement('div');
+        bar.className = 'nv-mobile-bar';
+        const self = this;
+
+        const pause = document.createElement('button');
+        pause.type = 'button';
+        pause.className = 'nv-button nv-button--primary nv-mobile-bar__button';
+        pause.textContent = 'Pausar';
+        pause.addEventListener('click', function () {
+            self.togglePause();
+            self._blur(pause);
+        });
+        this.mobilePauseButton = pause;
+        bar.appendChild(pause);
+
+        const swap = document.createElement('button');
+        swap.type = 'button';
+        swap.className = 'nv-button nv-mobile-bar__button';
+        swap.textContent = 'Cenários';
+        swap.addEventListener('click', function () {
+            if (self.onChangeScenario) { self.onChangeScenario(); }
+            self._blur(swap);
+        });
+        this.mobileScenarioButton = swap;
+        bar.appendChild(swap);
+
+        this.mobileBar = bar;
+        return bar;
+    }
+
     _buildCrosshair() {
         const crosshair = document.createElement('div');
         crosshair.className = 'nv-crosshair';
@@ -1678,16 +1782,63 @@ class NavigatorUI {
         return this;
     }
 
-    /** Force an immediate refresh of the list, HUD and inspector. */
+    /**
+     * Force an immediate refresh of the list, HUD and inspector.
+     *
+     * On mobile none of those three are on screen, so none of them run. That
+     * is not only a DOM saving: _refreshHud() reads `simulation.stats`, which
+     * sums the potential energy over every pair of bodies, and _refreshList()
+     * sorts the whole population. Skipping both is the single largest thing
+     * this file does for a phone's frame rate.
+     */
     refresh(immediate) {
         this._invalidateStats();
-        this._refreshList();
-        this._refreshHud();
-        this._refreshInspector();
+        if (this.mobile) {
+            this._refreshMobile();
+        } else {
+            this._refreshList();
+            this._refreshHud();
+            this._refreshInspector();
+        }
         this._statsFresh = false;
         this._statsCache = null;
         if (immediate) {
             this._accumulator = 0;
+        }
+        return this;
+    }
+
+    /**
+     * Switch between the desktop panels and the mobile strip. The DOM for both
+     * always exists, so this is a class toggle plus one refresh.
+     */
+    setMobile(value) {
+        const wanted = !!value;
+        if (wanted === this.mobile) {
+            return this;
+        }
+        this.mobile = wanted;
+        if (this.root) {
+            this.root.classList.toggle('nv-root--mobile', this.mobile);
+        }
+        if (this.mobile) {
+            this.setHelpVisible(false);
+        }
+        this._mobileTimeLast = null;
+        this._mobileCountLast = null;
+        this.refresh(true);
+        return this;
+    }
+
+    /**
+     * The one-sentence pt-BR caption a scenario publishes for the fixed mobile
+     * view (`meta.mobileNotes`). An empty string hides the line.
+     */
+    setMobileNote(text) {
+        this._mobileNote = (typeof text === 'string') ? text : '';
+        if (this.mobileNote) {
+            this.mobileNote.textContent = this._mobileNote;
+            this.mobileNote.classList.toggle('nv-hidden', !this._mobileNote);
         }
         return this;
     }
@@ -1742,6 +1893,10 @@ class NavigatorUI {
             this.pauseButton.textContent = this.paused ? 'Retomar' : 'Pausar';
             this.pauseButton.classList.toggle('nv-button--warn', this.paused);
         }
+        if (this.mobilePauseButton) {
+            this.mobilePauseButton.textContent = this.paused ? 'Retomar' : 'Pausar';
+            this.mobilePauseButton.classList.toggle('nv-button--warn', this.paused);
+        }
         if (this.root) {
             this.root.classList.toggle('nv-root--paused', this.paused);
         }
@@ -1767,6 +1922,9 @@ class NavigatorUI {
         this.scenarioId = identifier;
         if (this.hudPanel && this.hudPanel.nvTitle) {
             this.hudPanel.nvTitle.textContent = name || 'Simulação';
+        }
+        if (this.mobileName) {
+            this.mobileName.textContent = name || identifier || 'Simulação';
         }
         if (this.hudFields && this.hudFields.scenario) {
             NavigatorUI._writeStat(this.hudFields.scenario, name || identifier);
@@ -1912,7 +2070,9 @@ class NavigatorUI {
     }
 
     setHelpVisible(visible) {
-        this.helpVisible = !!visible;
+        // The help overlay is a keyboard reference; a phone has no keyboard and
+        // no room for it, so it can never be shown there.
+        this.helpVisible = !!visible && !this.mobile;
         this.helpOverlay.classList.toggle('nv-help--on', this.helpVisible);
         return this;
     }
@@ -2230,6 +2390,47 @@ class NavigatorUI {
             row.element.classList.toggle('nv-row--selected', isSelected);
             row.element.classList.toggle('nv-row--followed', isFollowed);
         }
+    }
+
+    /**
+     * The mobile strip: simulated time and a live body count, nothing else.
+     * One O(n) walk of the population, four times a second, no stats object.
+     */
+    _refreshMobile() {
+        const bodies = this._bodies();
+        let count = 0;
+        for (let i = 0; i < bodies.length; i++) {
+            const body = bodies[i];
+            if (body && !body.removed) {
+                count++;
+            }
+        }
+        this._totalBodies = count;
+        if (this.mobileCount && this._mobileCountLast !== count) {
+            this.mobileCount.textContent = NavigatorUI.formatInteger(count);
+            this._mobileCountLast = count;
+        }
+
+        let time = NaN;
+        if (this.getTime) {
+            try {
+                const value = this.getTime();
+                if (typeof value === 'number') {
+                    time = value;
+                }
+            } catch (e) { /* ignore */ }
+        }
+        const text = isFinite(time) ? NavigatorUI.formatYears(time) : '—';
+        if (this.mobileTime && this._mobileTimeLast !== text) {
+            this.mobileTime.textContent = text;
+            this._mobileTimeLast = text;
+        }
+
+        // The snow-line ring is derived from the stats object this path never
+        // fetches, so the renderer is told to hide it rather than to draw a
+        // stale radius.
+        this._snowLine = NaN;
+        return this;
     }
 
     _refreshHud() {

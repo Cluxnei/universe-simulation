@@ -97,6 +97,278 @@ let onRemovedHandler = null;
 let onSpawnedHandler = null;
 
 // ---------------------------------------------------------------------------
+// Mobile mode
+// ---------------------------------------------------------------------------
+//
+// A phone gets a SEMI-FIXED view: no orbiting, no pinch, no fly, no pointer
+// lock. Each scenario publishes the viewpoint it wants to be seen from through
+// `meta.mobileView` (see CameraController.normalizeMobileView), the camera sits
+// there and drifts slowly around the disk normal, and the UI shrinks to what is
+// useful with no controls at all.
+//
+// DETECTION is a coarse pointer plus a small viewport, never the user agent: a
+// laptop with a touchscreen reports `pointer: fine` for its primary pointer and
+// stays on the desktop build, while a tablet in landscape is judged by its
+// SHORT side so rotating it does not change the answer.
+//
+// OVERRIDE: `?mobile=1` forces it on, `?mobile=0` forces it off. That is how
+// the mode is inspected on a desktop browser.
+//
+// Everything below is a no-op while `mobileMode` is false, which is what keeps
+// the desktop build byte-for-byte the behaviour it had before.
+
+const MOBILE_VIEWPORT_LIMIT = 820;      // CSS px, measured on the SHORT side
+const MOBILE_PIXEL_RATIO_CAP = 1.5;     // a phone reporting 3 draws 4x the fragments
+const MOBILE_DETAIL_BODIES = 3;         // textured spheres in the LOD pool (desktop: 12)
+const MOBILE_DETAIL_SEGMENTS = 24;      // sphere tessellation for those (desktop: 48)
+const MOBILE_STAR_VISUALS = 24;         // star meshes + halos (desktop: 64)
+const MOBILE_STAR_LIGHTS = 2;           // point lights (desktop: 4)
+const MOBILE_ORBIT_TARGETS = 8;         // orbit lines drawn at once (desktop: up to 128)
+const MOBILE_ORBIT_BUDGET = 8;          // orbit slots repacked per frame (desktop: 24)
+const MOBILE_MAX_STEPS_PER_FRAME = 6;   // physics degrades to slow motion, not to jank
+
+let mobileMode = false;
+
+/**
+ * Publish the mode on `window` for the other scripts.
+ *
+ * A top-level `let` does NOT become a property of `window`, and scenarios.js is
+ * loaded before main.js, so a `typeof mobileMode` there would hit the temporal
+ * dead zone and throw rather than returning 'undefined'. An explicit property is
+ * the only form every script can test safely at any time.
+ */
+function publishMobileMode() {
+    try {
+        window.mobileMode = mobileMode;
+    } catch (e) { /* nothing else depends on this succeeding */ }
+}
+publishMobileMode();
+// logarithmicDepthBuffer is a WebGLRenderer CONSTRUCTOR option: it cannot be
+// toggled later, so it is latched at boot from the detection result. When it is
+// off the near plane has to be pulled in to keep the depth buffer usable.
+let depthIsLogarithmic = true;
+// The distance the active mobile view sits at, so the far plane can cover it.
+let mobileViewDistance = 0;
+// The disk normal of the active run, kept for re-entering / leaving the view.
+let activeDiskNormal = null;
+
+/**
+ * `?mobile=1` / `?mobile=0`, or null when the query string says nothing.
+ * @returns {boolean|null}
+ */
+function mobileOverride() {
+    let search = '';
+    try {
+        search = (window.location && window.location.search) || '';
+    } catch (e) {
+        return null;
+    }
+    if (!search) {
+        return null;
+    }
+    let match = null;
+    try {
+        match = /[?&]mobile=([^&#]*)/i.exec(search);
+    } catch (e) {
+        return null;
+    }
+    if (!match) {
+        return null;
+    }
+    let value = '';
+    try {
+        value = decodeURIComponent(match[1] || '').toLowerCase();
+    } catch (e) {
+        value = (match[1] || '').toLowerCase();
+    }
+    if (value === '' || value === '1' || value === 'true' || value === 'yes' || value === 'on') {
+        return true;
+    }
+    if (value === '0' || value === 'false' || value === 'no' || value === 'off') {
+        return false;
+    }
+    return null;
+}
+
+/** Should this session run the mobile build? Never throws. */
+function detectMobile() {
+    const override = mobileOverride();
+    if (override !== null) {
+        return override;
+    }
+    let coarse = false;
+    try {
+        if (typeof window.matchMedia === 'function') {
+            coarse = window.matchMedia('(pointer: coarse)').matches === true;
+        }
+    } catch (e) {
+        coarse = false;
+    }
+    if (!coarse) {
+        return false;
+    }
+    const width = numberOr(window.innerWidth, 0);
+    const height = numberOr(window.innerHeight, 0);
+    if (!(width > 0) || !(height > 0)) {
+        return true;                // a coarse pointer and no size to judge by
+    }
+    return Math.min(width, height) <= MOBILE_VIEWPORT_LIMIT;
+}
+
+/** Bodies in the full-detail textured pool. */
+function detailBodyCount() {
+    return mobileMode ? MOBILE_DETAIL_BODIES : 12;
+}
+
+/** How many stars get a mesh and a halo. */
+function starVisualLimit() {
+    return mobileMode ? Math.min(MOBILE_STAR_VISUALS, STAR_VISUAL_LIMIT) : STAR_VISUAL_LIMIT;
+}
+
+/** How many of those also carry a point light (each one costs a shader recompile). */
+function starLightLimit() {
+    return mobileMode ? Math.min(MOBILE_STAR_LIGHTS, STAR_LIGHT_LIMIT) : STAR_LIGHT_LIMIT;
+}
+
+/** Orbit slots repacked per frame. */
+function orbitSlotBudget() {
+    return mobileMode ? MOBILE_ORBIT_BUDGET : ORBIT_SLOT_BUDGET;
+}
+
+/**
+ * Device pixel ratio. Desktop keeps exactly what it always used; a phone is
+ * capped, because a devicePixelRatio of 3 is nine times the fragments for
+ * detail nobody can resolve at arm's length.
+ */
+function applyRendererQuality() {
+    if (!renderer) {
+        return;
+    }
+    const ratio = positiveOr(window.devicePixelRatio, 1);
+    renderer.setPixelRatio(mobileMode ? Math.min(ratio, MOBILE_PIXEL_RATIO_CAP) : ratio);
+}
+
+/**
+ * Near and far planes for the active run.
+ *
+ * The desktop range (a near plane a millionth of the scene) only works because
+ * of the logarithmic depth buffer, and only matters because the user can fly
+ * right up to a body. The fixed mobile view never leaves its viewpoint, so a
+ * few thousand to one is plenty - which is exactly what makes it safe to build
+ * the renderer without the logarithmic buffer there.
+ */
+function applyCameraClipping() {
+    if (!camera) {
+        return;
+    }
+    if (mobileMode || !depthIsLogarithmic) {
+        // The near plane is derived from the VIEWING DISTANCE, not from the
+        // scene: a scenario may ask to sit half an AU from a star, and a near
+        // plane scaled to a 4000 AU cluster would clip straight through it.
+        // 8x the reach covers the far side of the system even when the view is
+        // tracking a body out at its edge.
+        const reach = Math.max(sceneRadius, mobileViewDistance, 1e-3);
+        const closest = (mobileViewDistance > 0)
+            ? Math.min(sceneRadius, mobileViewDistance)
+            : sceneRadius;
+        camera.near = Math.max(closest * 0.005, 1e-4);
+        camera.far = Math.max(reach * 8, 100);
+    } else {
+        camera.near = Math.max(sceneRadius * 1e-6, 1e-4);
+        camera.far = Math.max(sceneRadius * 500, 1000);
+    }
+    camera.updateProjectionMatrix();
+}
+
+/**
+ * The view a scenario wants on a phone. `meta.mobileView` may be absent,
+ * partial or malformed: whatever is missing falls back to `meta.cameraDistance`
+ * and the disk normal the renderer already resolved, i.e. to the same framing
+ * the desktop build opens with.
+ */
+function mobileViewFor(meta, normal) {
+    const raw = (meta && meta.mobileView && typeof meta.mobileView === 'object')
+        ? meta.mobileView
+        : null;
+    const suggested = meta ? positiveOr(meta.cameraDistance, 0) : 0;
+    const fallback = suggested > 0 ? suggested : Math.max(sceneRadius * 2.2, 1);
+    return CameraController.normalizeMobileView(raw, {
+        normal: normal || activeDiskNormal || null,
+        defaultDistance: fallback
+    });
+}
+
+/** Enter or leave the semi-fixed view, matching the current mobileMode. */
+function applyMobileCamera() {
+    if (!cameraController || !camera) {
+        return;
+    }
+    if (mobileMode) {
+        const view = mobileViewFor(activeMeta, activeDiskNormal);
+        mobileViewDistance = view.distance;
+        cameraController.setFixedView(view, { normal: view.normal });
+        applyCameraClipping();
+        return;
+    }
+
+    mobileViewDistance = 0;
+    if (!cameraController.isFixed()) {
+        applyCameraClipping();
+        return;
+    }
+    // Back to the desktop camera: restore the opening framing rather than
+    // leaving the user parked wherever the fixed view happened to be.
+    cameraController.clearFixedView();
+    applyCameraClipping();
+    const hint = activeMeta ? positiveOr(activeMeta.cameraDistance, 0) : 0;
+    if (camera.up && camera.up.set) {
+        camera.up.set(0, 1, 0);
+    }
+    if (activeDiskNormal) {
+        orientCameraToDisk(activeDiskNormal, hint > 0 ? hint : undefined);
+    }
+    if (hint > 0) {
+        cameraController.controls.target.set(0, 0, 0);
+        cameraController.controls.saveState();
+    } else {
+        cameraController.frameAll({ duration: 0 });
+    }
+}
+
+/**
+ * Switch the whole application between the desktop and the mobile build.
+ * Called once at boot and again whenever the viewport or the pointer changes.
+ */
+function applyMobileMode(next, force) {
+    const wanted = !!next;
+    if (!force && wanted === mobileMode) {
+        return;
+    }
+    mobileMode = wanted;
+    publishMobileMode();
+
+    if (document && document.body) {
+        document.body.classList.toggle('nv-mobile', mobileMode);
+    }
+    if (mobileMode) {
+        // There is no way to aim a placement without camera control.
+        setSpawnArmed(false, true);
+    }
+
+    applyRendererQuality();
+    if (detailBodies) {
+        try {
+            detailBodies.setCount(detailBodyCount());
+        } catch (e) { /* cosmetic only */ }
+    }
+    if (ui && typeof ui.setMobile === 'function') {
+        ui.setMobile(mobileMode);
+    }
+    applyMobileCamera();
+    orbitTargetsDirty = true;
+}
+
+// ---------------------------------------------------------------------------
 // Defensive reads of constants.js
 // ---------------------------------------------------------------------------
 
@@ -323,9 +595,10 @@ function collectStars() {
     }
 
     // 1. the contract
+    const limit = starVisualLimit();
     const declared = simulation.stars;
     if (Array.isArray(declared)) {
-        for (let i = 0; i < declared.length && out.length < STAR_VISUAL_LIMIT; i++) {
+        for (let i = 0; i < declared.length && out.length < limit; i++) {
             const star = declared[i];
             if (star && !star.removed && star.position) {
                 out.push(star);
@@ -357,7 +630,7 @@ function collectStars() {
         starProbeCountdown = 120;
         scanForStars();
     }
-    for (let i = 0; i < starScanCache.length && out.length < STAR_VISUAL_LIMIT; i++) {
+    for (let i = 0; i < starScanCache.length && out.length < limit; i++) {
         const star = starScanCache[i];
         if (star && !star.removed && star.position) {
             out.push(star);
@@ -473,7 +746,7 @@ function createStarVisual(index) {
     // 0 disables attenuation: at 20 AU a physically attenuated light would leave
     // the outer disk black. Only the first few stars carry one.
     let light = null;
-    if (index < STAR_LIGHT_LIMIT) {
+    if (index < starLightLimit()) {
         light = new THREE.PointLight(0xffffff, 1.4, 0);
         group.add(light);
     }
@@ -505,7 +778,7 @@ function syncStars() {
         return;
     }
     const stars = collectStars();
-    const wanted = Math.min(stars.length, STAR_VISUAL_LIMIT);
+    const wanted = Math.min(stars.length, starVisualLimit());
     const boost = positiveOr(typeof STAR_EMISSIVE_BOOST !== 'undefined' ? STAR_EMISSIVE_BOOST : 0, 1);
 
     let pickablesDirty = (wanted !== starVisualCount);
@@ -1396,7 +1669,12 @@ function updateOrbitTargets() {
     targets.length = 0;
 
     if (orbitMode !== 'none') {
-        const wanted = ORBIT_SCOPE_COUNTS[orbitScope] || 0;
+        // A phone draws a handful of the most massive orbits, whatever scope
+        // the (hidden) desktop control was left on.
+        let wanted = ORBIT_SCOPE_COUNTS[orbitScope] || 0;
+        if (mobileMode && wanted > MOBILE_ORBIT_TARGETS) {
+            wanted = MOBILE_ORBIT_TARGETS;
+        }
         const planets = (simulation && Array.isArray(simulation.planets)) ? simulation.planets : [];
 
         // the bodies the user is actually looking at always get an orbit
@@ -1689,7 +1967,7 @@ function packTrail(index, slot, now) {
 function repackOrbitSlots(now) {
     const wantEllipses = ellipseMesh.visible;
     const wantTrails = trailMesh.visible;
-    let budget = ORBIT_SLOT_BUDGET;
+    let budget = orbitSlotBudget();
 
     for (let visited = 0; visited < ORBIT_MAX_SLOTS && budget > 0; visited++) {
         const index = orbitCursor;
@@ -3220,6 +3498,9 @@ function onWindowResize() {
     if (cameraController) {
         cameraController.handleResize();
     }
+    // Rotating a phone, or resizing a desktop window across the threshold,
+    // re-decides which build is running.
+    applyMobileMode(detectMobile());
 }
 
 /** Extra shortcuts owned by main.js, appended to the controller's own table. */
@@ -3311,14 +3592,30 @@ function initStage() {
     PERIODIC_TABLE_ELEMENTS = (new PeriodicTable()).atoms;
     resolveRenderRadiusMapping();
 
+    // Decided BEFORE the renderer exists: antialiasing and the logarithmic
+    // depth buffer are constructor options and cannot be changed afterwards.
+    mobileMode = detectMobile();
+    publishMobileMode();
+    if (document && document.body) {
+        document.body.classList.toggle('nv-mobile', mobileMode);
+    }
+
     // A logarithmic depth buffer is what makes a near plane of 1e-3 AU coexist
     // with a far plane of 1e4 AU: without it, standing next to a 0.02 AU embryo
     // and still seeing the outer disk is not possible in one pass.
+    //
+    // The mobile build cannot get near a body - the view is fixed - so it pays
+    // for neither that (it forces a per-fragment depth write, which costs the
+    // early-Z rejection a tiled mobile GPU depends on) nor for MSAA.
     camera = new THREE.PerspectiveCamera(70, width / height, 0.001, 10000);
     camera.position.set(0, 0, 60);
 
-    renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
-    renderer.setPixelRatio(window.devicePixelRatio);
+    depthIsLogarithmic = !mobileMode;
+    renderer = new THREE.WebGLRenderer({
+        antialias: !mobileMode,
+        logarithmicDepthBuffer: depthIsLogarithmic
+    });
+    applyRendererQuality();
     renderer.setSize(width, height);
     renderer.outputEncoding = THREE.sRGBEncoding;
 
@@ -3336,7 +3633,21 @@ function initStage() {
     attachSpawnListeners(renderer.domElement);
 
     window.addEventListener('resize', onWindowResize, false);
+    window.addEventListener('orientationchange', onWindowResize, false);
     window.addEventListener('keydown', onExtraKeyDown, false);
+
+    // A pointer change (a tablet gaining a mouse, or the browser's device
+    // emulation being switched on) flips the mode without a resize event.
+    try {
+        const query = window.matchMedia('(pointer: coarse)');
+        if (query) {
+            if (typeof query.addEventListener === 'function') {
+                query.addEventListener('change', onWindowResize);
+            } else if (typeof query.addListener === 'function') {
+                query.addListener(onWindowResize);
+            }
+        }
+    } catch (e) { /* matchMedia is optional */ }
 
     Object.assign(window, { scene, camera, renderer });
 }
@@ -3431,6 +3742,8 @@ function teardownRun() {
     renderFaults = 0;
     activeMeta = null;
     activeLabel = '';
+    activeDiskNormal = null;
+    mobileViewDistance = 0;
 }
 
 /**
@@ -3454,6 +3767,18 @@ function buildRun(id, params) {
     activeMeta = meta;
     activeLabel = resolveScenarioLabel(id, meta, simulation);
 
+    // A phone can afford a coarser opening angle in the Barnes-Hut tree. The
+    // extra error is invisible at the fixed distance the mobile view uses, and
+    // it roughly halves the cost of the gravity step - the biggest single
+    // saving available there. Guarded so an older octree without setTheta, or a
+    // missing constant, simply leaves the default alone.
+    if (mobileMode && simulation.octree && typeof simulation.octree.setTheta === 'function' &&
+        typeof BARNES_HUT_THETA_MOBILE === 'number' && BARNES_HUT_THETA_MOBILE > 0) {
+        try {
+            simulation.octree.setTheta(BARNES_HUT_THETA_MOBILE);
+        } catch (e) { /* the default theta is perfectly usable */ }
+    }
+
     // The timestep is a property of the scenario: a tight binary needs a far
     // smaller one than a 20 AU disk, and reusing the disk's would visibly break
     // it. Clamped so a malformed value cannot freeze the page.
@@ -3473,9 +3798,8 @@ function buildRun(id, params) {
     }
 
     sceneRadius = measureExtent(simulation.planets, meta);
-    camera.far = Math.max(sceneRadius * 500, 1000);
-    camera.near = Math.max(sceneRadius * 1e-6, 1e-4);
-    camera.updateProjectionMatrix();
+    mobileViewDistance = 0;
+    applyCameraClipping();
 
     world = new THREE.Group();
     world.name = 'world';
@@ -3490,10 +3814,17 @@ function buildRun(id, params) {
     // Most bodies are a few pixels wide, so texturing all of them is wasted. A
     // small pool of full-detail textured spheres follows whatever the camera is
     // actually looking at; everyone else stays a coloured instance.
-    textureLibrary = new BodyTextureLibrary();
+    // On a phone the pool is cut to three bodies at half the tessellation and
+    // a quarter of the texture area: at the fixed viewing distance almost
+    // nothing is more than a few pixels across, so the detail is invisible and
+    // the canvas work to generate it is not.
+    textureLibrary = new BodyTextureLibrary(mobileMode
+        ? { size: 256, maxEntries: 12, variants: 3, anisotropy: 1 }
+        : null);
     detailBodies = new DetailBodyPool(world, {
         library: textureLibrary,
-        count: 12,
+        count: detailBodyCount(),
+        segments: mobileMode ? MOBILE_DETAIL_SEGMENTS : 48,
         getCamera: () => camera,
         radiusOf: displayRadiusOf,
         skip: (planet) => starSet.has(planet)
@@ -3502,6 +3833,7 @@ function buildRun(id, params) {
     world.add(createStarLayer());
 
     const normal = resolveDiskNormal(simulation.planets, meta);
+    activeDiskNormal = normal;
     guides = createGuides(normal, sceneRadius);
     world.add(guides);
 
@@ -3553,6 +3885,7 @@ function buildRun(id, params) {
     };
 
     ui = new NavigatorUI({
+        mobile: mobileMode,
         getBodies: () => (simulation ? simulation.planets : []),
         getStats: () => (simulation ? simulation.stats : null),
         getCamera: () => camera,
@@ -3628,14 +3961,27 @@ function buildRun(id, params) {
         camera.up.set(0, 1, 0);
     }
     camera.position.set(0, 0, Math.max(sceneRadius * 2.2, 1));
-    orientCameraToDisk(normal, suggestedDistance > 0 ? suggestedDistance : undefined);
-    if (suggestedDistance > 0) {
-        cameraController.controls.target.set(0, 0, 0);
-        cameraController.controls.saveState();
+    if (mobileMode) {
+        // No frame-all, no flight: the scenario said where to stand.
+        applyMobileCamera();
     } else {
-        cameraController.frameAll({ duration: 0 });
+        orientCameraToDisk(normal, suggestedDistance > 0 ? suggestedDistance : undefined);
+        if (suggestedDistance > 0) {
+            cameraController.controls.target.set(0, 0, 0);
+            cameraController.controls.saveState();
+        } else {
+            cameraController.frameAll({ duration: 0 });
+        }
     }
 
+    if (typeof ui.setMobileNote === 'function') {
+        // meta.mobileNotes is a one-sentence pt-BR caption written for exactly
+        // this situation; meta.notes is the desktop text, used when it is absent.
+        const note = (typeof meta.mobileNotes === 'string' && meta.mobileNotes)
+            ? meta.mobileNotes
+            : ((typeof meta.notes === 'string') ? meta.notes : '');
+        ui.setMobileNote(note);
+    }
     if (typeof meta.notes === 'string' && meta.notes) {
         ui.notify(meta.notes);
     }
@@ -3792,7 +4138,11 @@ function boot() {
             // multiplier is what makes the 2x and 4x buttons actually do
             // something instead of silently discarding the backlog.
             const budget = positiveOr(typeof MAX_STEPS_PER_FRAME !== 'undefined' ? MAX_STEPS_PER_FRAME : 0, 8);
-            const maxSteps = Math.min(48, Math.max(1,
+            // A phone that cannot keep up must slow the universe down, not drop
+            // frames: with the cap low, a slow frame runs fewer steps and the
+            // simulation visibly runs in slow motion while the view stays fluid.
+            const hardCap = mobileMode ? MOBILE_MAX_STEPS_PER_FRAME : 48;
+            const maxSteps = Math.min(hardCap, Math.max(1,
                 Math.ceil(budget * Math.max(1, speedMultiplier))));
 
             let steps = 0;

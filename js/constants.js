@@ -36,6 +36,9 @@ const STAR_ENABLED = true
 // each: the oligarchic growth stage, which is the phase real late-accretion
 // simulations model with this many bodies.
 const PLANETS_NUMBER = 800
+// Body count dominates the cost on a phone. Scenarios clamp their defaults to
+// roughly this when the page is in mobile mode.
+const PLANETS_NUMBER_MOBILE = 220
 const DISK_TOTAL_MASS = 1e-3                // Msun
 const DISK_INNER_RADIUS = 0.5               // AU
 const DISK_OUTER_RADIUS = 20.0              // AU
@@ -193,6 +196,10 @@ const BLACK_HOLE_COLOR_HEX = '#06060a'
 // the mass, and approximating it would wreck every orbit in the disk.
 const USE_BARNES_HUT = true
 const BARNES_HUT_THETA = 0.5
+// Mobile trades accuracy for tree-traversal work. At the fixed viewing distance
+// a phone uses, the extra error is invisible, and this roughly halves the cost
+// of the gravity step - the largest single saving available on that hardware.
+const BARNES_HUT_THETA_MOBILE = 0.8
 const BARNES_HUT_MIN_BODIES = 32
 const BARNES_HUT_MAX_DEPTH = 24
 

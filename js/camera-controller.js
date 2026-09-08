@@ -111,6 +111,19 @@ class CameraController {
         // housekeeping timers
         this._membershipTimer = 0;
 
+        // --- semi-fixed view (mobile) --------------------------------------
+        // Null on desktop, which is what keeps every branch below inert there.
+        this.fixedView = null;             // normalised meta.mobileView
+        this._fixedTarget = null;          // the followed body, when asked for
+        this._fixedAzimuth = 0;            // radians, drifts with REAL time
+        this._fixedTimer = 0;              // follow re-acquisition throttle
+        this._fixedSavedUp = new THREE.Vector3(0, 1, 0);
+        this._fixedU = new THREE.Vector3(1, 0, 0);
+        this._fixedV = new THREE.Vector3(0, 1, 0);
+        this._fixedN = new THREE.Vector3(0, 0, 1);
+        this._fixedPoint = new THREE.Vector3();
+        this._fixedOffset = { x: 0, y: 0, z: 0 };
+
         // click vs drag discrimination
         this._pointerDown = null;
 
@@ -182,7 +195,9 @@ class CameraController {
     }
 
     setEnabled(value) {
-        this.enabled = !!value;
+        // The semi-fixed view owns the camera outright: nothing may re-enable
+        // input while it is on, including openPicker() handing control back.
+        this.enabled = !!value && !this.fixedView;
         this.controls.enabled = this.enabled
             && !this._flight
             && this.mode !== CameraController.FLY
@@ -635,6 +650,362 @@ class CameraController {
     }
 
     // -----------------------------------------------------------------------
+    // semi-fixed view (mobile)
+    // -----------------------------------------------------------------------
+    //
+    // On a phone there are no camera controls at all: each scenario is shown
+    // from a viewpoint it chooses itself, through `meta.mobileView`. The camera
+    // sits at a fixed distance, elevation and azimuth relative to the disk
+    // normal, looks at a fixed point or at a body it tracks, and drifts slowly
+    // around the normal so the frame is *semi*-fixed rather than a photograph.
+    //
+    // This is NOT a member of MODES: adding it there would put it in the
+    // desktop `cycleMode()` rotation. It is a separate switch that overrides
+    // whatever mode is set, and turning it off restores the mode untouched.
+    //
+    // EVERY field of meta.mobileView may be missing or malformed. Validation
+    // lives in the static helpers below, which are pure (no THREE, no DOM) so
+    // that the placement maths can be exercised outside a browser.
+
+    static get FIXED() { return 'fixed'; }
+
+    /** A finite number, or `fallback`. */
+    static safeNumber(value, fallback) {
+        return (typeof value === 'number' && isFinite(value)) ? value : fallback;
+    }
+
+    /** `value` clamped to [min, max]; anything non-finite becomes `min`. */
+    static clampNumber(value, min, max) {
+        if (!(typeof value === 'number' && isFinite(value))) {
+            return min;
+        }
+        return Math.min(Math.max(value, min), max);
+    }
+
+    /**
+     * A unit vector from a possibly malformed {x, y, z}. Falls back to +Z,
+     * which is the plane the rest of the render layer already builds rings in.
+     * @returns {{x:number, y:number, z:number}} a plain object, never THREE
+     */
+    static normalizeAxis(raw) {
+        // All three components must be finite numbers, exactly as
+        // resolveDiskNormal() in main.js demands: a vector with one bad
+        // component says nothing trustworthy about the other two.
+        const x = CameraController.safeNumber(raw && raw.x, NaN);
+        const y = CameraController.safeNumber(raw && raw.y, NaN);
+        const z = CameraController.safeNumber(raw && raw.z, NaN);
+        const length = Math.sqrt(x * x + y * y + z * z);
+        if (!(length > 1e-9) || !isFinite(length)) {
+            return { x: 0, y: 0, z: 1 };
+        }
+        return { x: x / length, y: y / length, z: z / length };
+    }
+
+    /**
+     * An orthonormal basis of the plane whose normal is the unit vector `n`.
+     * u = normalize(n x helper), v = n x u, so (u, v, n) is right-handed.
+     */
+    static planeBasis(n) {
+        const helper = (Math.abs(n.z) < 0.9)
+            ? { x: 0, y: 0, z: 1 }
+            : { x: 1, y: 0, z: 0 };
+        let ux = n.y * helper.z - n.z * helper.y;
+        let uy = n.z * helper.x - n.x * helper.z;
+        let uz = n.x * helper.y - n.y * helper.x;
+        let length = Math.sqrt(ux * ux + uy * uy + uz * uz);
+        if (!(length > 1e-9)) {
+            ux = 1; uy = 0; uz = 0; length = 1;
+        }
+        ux /= length; uy /= length; uz /= length;
+        const vx = n.y * uz - n.z * uy;
+        const vy = n.z * ux - n.x * uz;
+        const vz = n.x * uy - n.y * ux;
+        return { u: { x: ux, y: uy, z: uz }, v: { x: vx, y: vy, z: vz } };
+    }
+
+    /**
+     * The camera's offset from its target, given a precomputed basis.
+     *
+     *   offset = distance * ( u cos(el) cos(az) + v cos(el) sin(az) + n sin(el) )
+     *
+     * `u`, `v`, `n` may be plain objects or THREE.Vector3 - only .x/.y/.z are
+     * read. `out` is written in place, so the render loop allocates nothing.
+     */
+    static mobileOffsetFromBasis(u, v, n, distance, elevationDegrees, azimuthDegrees, out) {
+        const target = out || { x: 0, y: 0, z: 0 };
+        let d = CameraController.safeNumber(distance, 1);
+        if (!(d > 0)) {
+            d = 1;
+        }
+        const elevation = CameraController.clampNumber(elevationDegrees, -89, 89) * Math.PI / 180;
+        const azimuth = CameraController.safeNumber(azimuthDegrees, 0) * Math.PI / 180;
+        const flat = Math.cos(elevation);
+        const up = Math.sin(elevation);
+        const a = flat * Math.cos(azimuth) * d;
+        const b = flat * Math.sin(azimuth) * d;
+        const c = up * d;
+        target.x = u.x * a + v.x * b + n.x * c;
+        target.y = u.y * a + v.y * b + n.y * c;
+        target.z = u.z * a + v.z * b + n.z * c;
+        return target;
+    }
+
+    /** mobileOffsetFromBasis, deriving the basis from a (possibly bad) normal. */
+    static mobileOffset(normal, distance, elevationDegrees, azimuthDegrees, out) {
+        const n = CameraController.normalizeAxis(normal);
+        const basis = CameraController.planeBasis(n);
+        return CameraController.mobileOffsetFromBasis(
+            basis.u, basis.v, n, distance, elevationDegrees, azimuthDegrees, out);
+    }
+
+    /**
+     * Validate and clamp a scenario's `meta.mobileView`. Nothing here throws:
+     * `raw` may be undefined, null, a string, or an object with every field
+     * wrong, and the result is always a complete, usable view.
+     *
+     * @param {*} raw          meta.mobileView, whatever it turned out to be
+     * @param {Object} [options]
+     *   normal          {x,y,z}  the disk normal to place the camera against
+     *   defaultDistance {number} used when `raw.distance` is missing or bad
+     * @returns {{distance:number, elevation:number, azimuth:number,
+     *           target:?{x:number,y:number,z:number}, autoRotate:number,
+     *           follow:?string, normal:{x:number,y:number,z:number}}}
+     */
+    static normalizeMobileView(raw, options) {
+        options = options || {};
+        const source = (raw && typeof raw === 'object') ? raw : {};
+
+        let fallback = CameraController.safeNumber(options.defaultDistance, NaN);
+        if (!(fallback > 0)) {
+            fallback = CameraController.DEFAULT_MOBILE_DISTANCE;
+        }
+        let distance = CameraController.safeNumber(source.distance, NaN);
+        if (!(distance > 0)) {
+            distance = fallback;
+        }
+        distance = Math.min(Math.max(distance, 1e-3), 1e7);
+
+        const elevation = CameraController.clampNumber(
+            CameraController.safeNumber(source.elevation, 28), -89, 89);
+
+        // Any azimuth is legal; it is only folded into [0, 360) so the drift
+        // does not start from an absurd number.
+        let azimuth = CameraController.safeNumber(source.azimuth, 35);
+        azimuth = ((azimuth % 360) + 360) % 360;
+
+        let target = null;
+        const rawTarget = source.target;
+        if (rawTarget && typeof rawTarget === 'object') {
+            const x = CameraController.safeNumber(rawTarget.x, NaN);
+            const y = CameraController.safeNumber(rawTarget.y, NaN);
+            const z = CameraController.safeNumber(rawTarget.z, NaN);
+            if (isFinite(x) && isFinite(y) && isFinite(z)) {
+                target = { x: x, y: y, z: z };
+            }
+        }
+
+        // Degrees per REAL second. Clamped hard: the brief says keep it slow,
+        // and a scenario asking for 400 deg/s would be unwatchable.
+        const autoRotate = CameraController.clampNumber(
+            CameraController.safeNumber(source.autoRotate, 0), -30, 30);
+
+        const follow = (source.follow === 'dominant' || source.follow === 'largest')
+            ? source.follow
+            : null;
+
+        const normal = CameraController.normalizeAxis(
+            options.normal || source.normal || null);
+
+        return {
+            distance: distance,
+            elevation: elevation,
+            azimuth: azimuth,
+            target: target,
+            autoRotate: autoRotate,
+            follow: follow,
+            normal: normal
+        };
+    }
+
+    /** AU. Only used when a scenario publishes no usable distance at all. */
+    static get DEFAULT_MOBILE_DISTANCE() { return 40; }
+
+    /** Is the semi-fixed view currently driving the camera? */
+    isFixed() {
+        return !!this.fixedView;
+    }
+
+    /** The normalised view in force, or null. */
+    getFixedView() {
+        return this.fixedView;
+    }
+
+    /**
+     * Turn the semi-fixed view on. Input handling (OrbitControls, the keyboard,
+     * picking, pointer lock) is switched off rather than fought with.
+     *
+     * @param {*} raw        meta.mobileView, in any state
+     * @param {Object} [options] see normalizeMobileView
+     */
+    setFixedView(raw, options) {
+        const view = CameraController.normalizeMobileView(raw, options);
+
+        if (!this.fixedView) {
+            this._fixedSavedUp.copy(this.camera.up);
+        }
+
+        this.cancelFlight();
+        this.stopFollowing();          // must run BEFORE input is switched off
+        // Not silent: the panel must forget the selection too, or flipping back
+        // to the desktop build would leave an inspector pointing at nothing.
+        this.select(null);
+
+        this.fixedView = view;
+        this._fixedAzimuth = view.azimuth * Math.PI / 180;
+        this._fixedTarget = null;
+        this._fixedTimer = Infinity;   // force an immediate re-acquisition
+        this.mode = CameraController.ORBIT;
+
+        const basis = CameraController.planeBasis(view.normal);
+        this._fixedU.set(basis.u.x, basis.u.y, basis.u.z);
+        this._fixedV.set(basis.v.x, basis.v.y, basis.v.z);
+        this._fixedN.set(view.normal.x, view.normal.y, view.normal.z);
+
+        this.enabled = false;
+        this.controls.enabled = false;
+        this._keys = Object.create(null);
+        this.exitPointerLock();
+
+        this._applyFixedView(0, true);
+        return this;
+    }
+
+    /** Turn it off and hand the camera back to the ordinary modes. */
+    clearFixedView() {
+        if (!this.fixedView) {
+            return this;
+        }
+        this.fixedView = null;
+        this._fixedTarget = null;
+        if (this.camera.up && this.camera.up.copy) {
+            this.camera.up.copy(this._fixedSavedUp);
+        }
+        this.setEnabled(true);
+        return this;
+    }
+
+    /**
+     * Place the camera for this frame.
+     * @param {number} dt REAL seconds since the previous frame
+     * @param {boolean} immediate re-acquire the followed body right now
+     */
+    _applyFixedView(dt, immediate) {
+        const view = this.fixedView;
+        if (!view) {
+            return this;
+        }
+        if (!(typeof dt === 'number' && isFinite(dt) && dt > 0)) {
+            dt = 0;
+        }
+
+        // Real seconds, so the drift is the same at 1x and at 4x, and continues
+        // while the simulation is paused.
+        if (view.autoRotate) {
+            const twoPi = Math.PI * 2;
+            this._fixedAzimuth += view.autoRotate * Math.PI / 180 * dt;
+            this._fixedAzimuth = ((this._fixedAzimuth % twoPi) + twoPi) % twoPi;
+        }
+
+        this._fixedTimer += dt;
+        if (view.follow) {
+            const lost = !this._fixedTarget || this._fixedTarget.removed;
+            if (immediate || lost || this._fixedTimer >= 0.5) {
+                this._fixedTimer = 0;
+                this._fixedTarget = this._pickFixedTarget(view.follow);
+            }
+        } else {
+            this._fixedTarget = null;
+        }
+
+        const point = this._fixedPoint;
+        point.set(0, 0, 0);
+        if (this._fixedTarget && !this._fixedTarget.removed) {
+            this._readPosition(this._fixedTarget, point);
+        } else if (view.target) {
+            point.set(view.target.x, view.target.y, view.target.z);
+        }
+
+        const offset = CameraController.mobileOffsetFromBasis(
+            this._fixedU, this._fixedV, this._fixedN,
+            view.distance, view.elevation,
+            this._fixedAzimuth * 180 / Math.PI,
+            this._fixedOffset);
+
+        this.camera.position.set(
+            point.x + offset.x, point.y + offset.y, point.z + offset.z);
+        this.controls.target.copy(point);
+        if (this.camera.up && this.camera.up.set) {
+            // The disk normal is "up", so the plane reads as a plane rather
+            // than as an arbitrarily rolled silhouette.
+            this.camera.up.set(this._fixedN.x, this._fixedN.y, this._fixedN.z);
+        }
+        this.camera.lookAt(point);
+        return this;
+    }
+
+    /**
+     * The body the view should track.
+     *   'dominant' -> the heaviest star or black hole
+     *   'largest'  -> the heaviest body of any kind
+     * Re-run whenever the current target dies, so merges re-target on their own.
+     */
+    _pickFixedTarget(kind) {
+        const bodies = this._bodies();
+        let best = null;
+        let bestMass = -Infinity;
+        const dominantOnly = (kind === 'dominant');
+
+        for (let i = 0; i < bodies.length; i++) {
+            const body = bodies[i];
+            if (!body || body.removed || !body.position) {
+                continue;
+            }
+            const p = body.position;
+            if (!isFinite(p.x) || !isFinite(p.y) || !isFinite(p.z)) {
+                continue;
+            }
+            if (dominantOnly && !CameraController.isDominantCandidate(body)) {
+                continue;
+            }
+            const mass = CameraController.safeNumber(body.mass, 0);
+            if (mass > bestMass) {
+                bestMass = mass;
+                best = body;
+            }
+        }
+
+        // A scenario may ask to track the dominant star and then contain none
+        // (a cluster of embryos, a disk whose star was swallowed). Falling back
+        // to the heaviest body keeps the frame pointed at something.
+        if (!best && dominantOnly) {
+            return this._pickFixedTarget('largest');
+        }
+        return best;
+    }
+
+    /** Star or black hole, by whichever field the physics layer publishes. */
+    static isDominantCandidate(planet) {
+        if (!planet) {
+            return false;
+        }
+        if (planet.isBlackHole === true || planet.isCentralStar === true) {
+            return true;
+        }
+        const kind = planet.classification;
+        return kind === 'star' || kind === 'blackHole';
+    }
+
+    // -----------------------------------------------------------------------
     // free-fly speed
     // -----------------------------------------------------------------------
 
@@ -682,6 +1053,13 @@ class CameraController {
         dt = Math.min(dt, 0.1);
 
         this._pruneDeadReferences(dt);
+
+        // The semi-fixed view replaces every other camera behaviour, and it is
+        // driven by REAL seconds so its drift is independent of the sim speed.
+        if (this.fixedView) {
+            this._applyFixedView(dt, false);
+            return this;
+        }
 
         if (this._flight) {
             this._updateFlight(dt);

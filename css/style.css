@@ -1684,3 +1684,268 @@ body.nv-armed canvas {
         max-height: calc(100vh - 140px);
     }
 }
+
+/* ==========================================================================
+   mobile — semi-fixed view
+   --------------------------------------------------------------------------
+   `body.nv-mobile` is set by main.js from a coarse pointer plus a small
+   viewport, or forced with ?mobile=1 / ?mobile=0. It is deliberately keyed off
+   the CLASS and not off a media query, so the mode can be inspected at any
+   window size on a desktop browser and so the two never disagree with the
+   JavaScript about which build is running.
+
+   There are no camera controls on a phone: each scenario is shown from a fixed
+   viewpoint of its own. So everything that exists to act on the camera or on a
+   body - the body list, the inspector, the orbit controls, the "Adicionar
+   corpo" tool, the playback bar and the keyboard help - is hidden outright
+   rather than shrunk, and what is left is a read-only strip plus two buttons.
+   ========================================================================== */
+
+body.nv-mobile .nv-hud,
+body.nv-mobile .nv-bodies,
+body.nv-mobile .nv-inspector,
+body.nv-mobile .nv-spawn,
+body.nv-mobile .nv-playback,
+body.nv-mobile .nv-help,
+body.nv-mobile .nv-crosshair {
+    display: none;
+}
+
+/* nothing on a touch screen has a hover state to lose, and the grey flash on
+   every tap makes the buttons feel broken */
+body.nv-mobile {
+    -webkit-tap-highlight-color: transparent;
+}
+
+.nv-root--mobile {
+    font-size: 13px;
+}
+
+/* the overlay root is pointer-events: none; these two are real widgets */
+.nv-root--mobile .nv-mobile-top,
+.nv-root--mobile .nv-mobile-bar {
+    pointer-events: auto;
+}
+
+/* --- the read-only strip, top of the screen ----------------------------- */
+
+.nv-mobile-top,
+.nv-mobile-bar {
+    display: none;
+}
+
+.nv-root--mobile .nv-mobile-top {
+    position: absolute;
+    top: calc(10px + env(safe-area-inset-top, 0px));
+    left: calc(10px + env(safe-area-inset-left, 0px));
+    right: calc(10px + env(safe-area-inset-right, 0px));
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    background: var(--nv-panel-bg);
+    border: 1px solid var(--nv-border);
+    border-radius: var(--nv-radius);
+    box-shadow: var(--nv-shadow);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+}
+
+.nv-mobile-top__name {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    color: var(--nv-accent);
+}
+
+/* meta.mobileNotes: one sentence explaining what this fixed view is showing */
+.nv-mobile-top__note {
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--nv-dim);
+}
+
+.nv-mobile-top__stats {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+}
+
+.nv-mobile-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.nv-mobile-stat__label {
+    font-size: 10px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--nv-faint);
+}
+
+.nv-mobile-stat__value {
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+    color: var(--nv-text);
+}
+
+/* --- the two buttons, bottom of the screen ------------------------------ */
+
+.nv-root--mobile .nv-mobile-bar {
+    position: absolute;
+    left: calc(10px + env(safe-area-inset-left, 0px));
+    right: calc(10px + env(safe-area-inset-right, 0px));
+    bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    display: flex;
+    gap: 10px;
+}
+
+.nv-mobile-bar__button {
+    flex: 1 1 0;
+    min-height: 48px;          /* a thumb, not a mouse pointer */
+    font-size: 14px;
+    border-radius: var(--nv-radius);
+    box-shadow: var(--nv-shadow);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+}
+
+/* toasts sit above the button bar instead of underneath it */
+.nv-root--mobile .nv-toasts {
+    left: calc(10px + env(safe-area-inset-left, 0px));
+    right: calc(10px + env(safe-area-inset-right, 0px));
+    bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+    max-width: none;
+}
+
+.nv-root--mobile .nv-toast {
+    font-size: 12px;
+}
+
+/* ==========================================================================
+   mobile — the scenario picker
+   --------------------------------------------------------------------------
+   The picker is the ONLY real interaction on a phone, so it gets the whole
+   screen: one scrolling column, full-width cards, a footer pinned to the
+   bottom, and tap targets sized for a thumb. Text inputs go to 16px because
+   anything smaller makes iOS Safari zoom the page when they take focus.
+   ========================================================================== */
+
+body.nv-mobile .nv-launch {
+    padding: 0;
+    font-size: 13px;
+}
+
+body.nv-mobile .nv-launch__dialog {
+    width: 100%;
+    height: 100%;
+    max-height: 100%;
+    border: none;
+    border-radius: 0;
+}
+
+body.nv-mobile .nv-launch__header {
+    padding: calc(14px + env(safe-area-inset-top, 0px)) 16px 12px;
+}
+
+body.nv-mobile .nv-launch__subtitle {
+    font-size: 12px;
+}
+
+/* one column, and ONE scroll region: two nested scrollers on a touch screen
+   means the wrong one moves half the time */
+body.nv-mobile .nv-launch__body {
+    display: block;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+body.nv-mobile .nv-launch__left {
+    border-right: none;
+    border-bottom: 1px solid var(--nv-border);
+}
+
+body.nv-mobile .nv-launch__cards,
+body.nv-mobile .nv-launch__right {
+    max-height: none;
+    overflow: visible;
+}
+
+body.nv-mobile .nv-launch__filters {
+    gap: 7px;
+}
+
+body.nv-mobile .nv-launch__filters .nv-chip {
+    min-height: 36px;
+    padding: 0 12px;
+    font-size: 12px;
+}
+
+body.nv-mobile .nv-scenario {
+    padding: 12px 13px;
+    font-size: 13px;
+    border-radius: 10px;
+}
+
+body.nv-mobile .nv-scenario__description {
+    font-size: 12px;
+}
+
+body.nv-mobile .nv-launch__name {
+    font-size: 14px;
+}
+
+body.nv-mobile .nv-launch__description,
+body.nv-mobile .nv-launch__kept,
+body.nv-mobile .nv-param__help {
+    font-size: 12px;
+}
+
+body.nv-mobile .nv-param__label,
+body.nv-mobile .nv-param__value {
+    font-size: 12px;
+}
+
+/* a 4px range track cannot be grabbed with a fingertip */
+body.nv-mobile .nv-param__range {
+    height: 34px;
+}
+
+body.nv-mobile .nv-param__number,
+body.nv-mobile .nv-param__select {
+    min-height: 40px;
+    font-size: 16px;
+}
+
+body.nv-mobile .nv-param__check {
+    width: 22px;
+    height: 22px;
+}
+
+body.nv-mobile .nv-launch__footer {
+    gap: 8px;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+    background: var(--nv-panel-bg-solid);
+}
+
+/* the spacer would push the buttons off a narrow screen */
+body.nv-mobile .nv-launch__spacer {
+    display: none;
+}
+
+body.nv-mobile .nv-launch__footer .nv-button {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 46px;
+    padding: 8px 10px;
+    font-size: 13px;
+}
+
+body.nv-mobile .nv-launch__error .nv-button {
+    min-height: 44px;
+}
+
+body.nv-mobile .nv-param__number {
+    width: 96px;
+}
