@@ -2378,8 +2378,30 @@ const SCENARIO_TIDAL_DISRUPTION = {
                   ' UA: não é resolvido).'
                 : ' (resolvido: ' + (horizon / SOFTENING).toFixed(0) +
                   ' vezes o comprimento de suavização).')
-        notes += ' A simulação não tem hidrodinâmica: a ruptura é representada ' +
-            'pela captura da estrela, não por destroços.'
+        // What the ruptured star actually becomes depends on the debris switch,
+        // so the note has to follow it rather than assert one of the two.
+        const debrisOn = (typeof TIDAL_DEBRIS_ENABLED !== 'undefined') && TIDAL_DEBRIS_ENABLED
+        if(debrisOn){
+            notes += ' A estrela é substituída por ' +
+                ((typeof TIDAL_DEBRIS_PARTICLES !== 'undefined') ? TIDAL_DEBRIS_PARTICLES : 600) +
+                ' fragmentos: cerca de metade fica ligada e retorna, o resto escapa. ' +
+                'O retorno segue a lei t^(-5/3) dos eventos reais de ruptura por maré. ' +
+                'Não há hidrodinâmica - os fragmentos são massas gravitacionais, ' +
+                'não fluido.'
+            // The frozen-in approximation the stream rests on needs the tidal
+            // radius to be well clear of the softening length; on a stellar-mass
+            // hole it is not, and the stream is illustrative rather than faithful.
+            if(tidal < 40 * SOFTENING)
+                notes += ' Atenção: com esta massa o raio de maré é apenas ' +
+                    (tidal / SOFTENING).toFixed(0) + ' vezes o comprimento de ' +
+                    'suavização, então o fluxo de destroços é ilustrativo e não ' +
+                    'quantitativo. Use um buraco negro acima de 1e4 massas solares ' +
+                    'para um resultado fiel.'
+        }else{
+            notes += ' A simulação não tem hidrodinâmica: a ruptura é representada ' +
+                'pela captura da estrela, não por destroços ' +
+                '(TIDAL_DEBRIS_ENABLED está desligado).'
+        }
         return {
             bodies,
             meta: {

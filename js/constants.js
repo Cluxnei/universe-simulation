@@ -225,3 +225,119 @@ const RENDER_BLACK_HOLE_RADIUS_MAX = 1.5
 // Blackbody colour is used for anything that emits its own light; everything
 // else is shaded by composition.
 const STAR_EMISSIVE_BOOST = 3.0
+
+// --- Black hole debris --------------------------------------------------------
+//
+// THE ABORT SWITCH. False restores the behaviour that shipped: a star crossing
+// a black hole's tidal radius is absorbed whole, in one step, by the merge path
+// in simulation.js. With this false, js/debris.js touches nothing - every
+// function in it returns on its first line, no body is created, no method is
+// wrapped, no field is added to Simulation - and the capture path is exactly
+// the code that was there before, instruction for instruction. Turning it off
+// is the supported way to back the whole feature out; deleting js/debris.js,
+// its <script> tag and the one `if` in handlePair() removes it entirely.
+const TIDAL_DEBRIS_ENABLED = true
+
+// Fragments per disruption. 600 costs about +1.2 ms/step against 1.6 ms for the
+// 800-body disk, which is affordable; thousands are not. The count only has to
+// resolve a smooth distribution in ENERGY, and 600 samples of a flat
+// distribution give a fallback curve good to a few percent per decade.
+const TIDAL_DEBRIS_PARTICLES = 600
+
+// Hard ceiling on the total number of bodies. A disruption that cannot fit a
+// stream inside this is declined and the star is swallowed whole instead, which
+// is always a correct outcome and costs nothing.
+const TIDAL_DEBRIS_MAX_BODIES = 4000
+
+// Below this a "stream" is just noise and is not worth the bodies.
+const TIDAL_DEBRIS_MIN_PARTICLES = 16
+
+// No fragment may weigh more than this. Above ~0.060 Msun structure.js
+// classifies a body as CLASS_STAR, refreshStars() would promote it into the
+// exactly-summed set, and a few hundred direct-summed bodies is an O(n^2) force
+// loop. A heavy star is therefore cut into more pieces, not bigger ones.
+const TIDAL_DEBRIS_MAX_PARTICLE_MASS = 0.05          // Msun
+
+// Disrupt only if the encounter's periapsis is inside this many tidal radii.
+// The collision broad phase fires as soon as the swept path comes within the
+// capture radius ENHANCED BY GRAVITATIONAL FOCUSING - up to three times the
+// tidal radius on a plunging orbit - so "captured" is not the same statement as
+// "went inside the tidal radius". A star that was only ever going to graze is
+// handed back to the absorb-whole path.
+const TIDAL_DEBRIS_PERIAPSIS_FACTOR = 1.0
+
+// Accretion radius of a fragment, as a multiple of its physical radius. ZERO,
+// and that is the point: a 1/600th of a solar mass fragment has a radius of
+// ~1e-3 AU, and the ordinary ACCRETION_RADIUS_FACTOR = 800 would give it a
+// 0.8 AU collision target - the whole stream would clump back into a single
+// ball within a few steps and there would be no stream at all. With zero, the
+// contact distance for a debris-debris pair is 0 + 0 and handlePair() rejects
+// it on its first line. The BLACK HOLE still swallows debris normally: its
+// reach is its own pairwise capture radius and does not depend on the victim's
+// accretion radius at all.
+const TIDAL_DEBRIS_ACCRETION_RADIUS_FACTOR = 0
+
+// Width of the stream across its axis. THIS IS THE LEAST OBVIOUS NUMBER HERE
+// and it is not cosmetic.
+//
+// Six hundred fragments strung across a solar radius sit 1.5e-5 AU apart, which
+// is SIXTY-FIVE TIMES CLOSER THAN THE SOFTENING LENGTH, and inside that length
+// the Plummer kernel is a linear spring rather than gravity. A stream that
+// tightly packed is held together by a force that is not real, it resists the
+// tide that is supposed to stretch it, and it snaps into clumps: measured, the
+// flat dM/dE the entire fallback rate rests on collapses into four spikes
+// within a hundred steps and the t^(-5/3) goes with it.
+//
+// So the fragments are spread out until their mean spacing is this many
+// softening lengths, where the kernel is honest gravity again and the tide beats
+// their mutual attraction by three orders of magnitude. At 4 the measured energy
+// distribution is unchanged from spawn to five thousand steps later. This is the
+// same species of licence as ACCRETION_RADIUS_FACTOR: a macro-particle is given
+// a size the fluid element it stands for does not have.
+const TIDAL_DEBRIS_SPACING_SOFTENINGS = 4
+
+// Floor on that width, as a fraction of the star's radius: the stream is never
+// drawn thinner than this even when the spacing rule would allow it.
+const TIDAL_DEBRIS_TRANSVERSE_FRACTION = 0.25
+
+// Ceiling on it, as a fraction of the tidal radius. The stream can never be
+// wider than a fraction of the region the star was destroyed in, whatever the
+// spacing rule asks for. When the ceiling binds - which is what happens for a
+// STELLAR-MASS hole, where the tidal radius is only ten softening lengths - the
+// fragments are packed below the softening length again and the stream is not
+// resolved. The code still conserves everything exactly; it simply is not
+// modelling a stream any more. See tidalDebrisResolution() in debris.js.
+const TIDAL_DEBRIS_MAX_WIDTH_FACTOR = 0.15
+
+// Fallback. A fragment that has been out past APOAPSIS_FACTOR tidal radii and
+// comes back inside RETURN_RADIUS_FACTOR of them has completed an orbit and is
+// accreted, feeding the hole's existing accretion-disk bookkeeping. This is the
+// prompt-accretion closure every semi-analytic model of a tidal disruption
+// makes, and it is what turns the t^(-5/3) fallback rate into a t^(-5/3) light
+// curve. The APOAPSIS test is what stops the entire stream being eaten during
+// the disruption passage itself, when all of it is inside the tidal radius and
+// none of it has fallen back yet.
+const TIDAL_DEBRIS_RETURN_RADIUS_FACTOR = 1.0
+const TIDAL_DEBRIS_APOAPSIS_FACTOR = 3.0
+
+// Debris is hidden from the collision broad phase. That phase sizes its grid
+// cells from the largest reach in the system - around a supermassive hole, its
+// 0.93 AU capture radius - so a thin stream lands in a handful of cells and the
+// phase generates the full N^2 candidate pairs, 180000 per step for 600
+// fragments, every one rejected immediately. Measured: 6.58 ms/step with the
+// pair tests, 1.43 ms/step without, against 1.43 ms of forces and integration.
+// Hiding them is also a stronger guarantee that the stream cannot clump back
+// together than the zero accretion radius above. The price is that debris
+// cannot collide with an ordinary star or planet in flight; set this false to
+// get that back, at about four times the cost per step.
+const TIDAL_DEBRIS_COLLISIONLESS = true
+
+// Cleanup. Unbound debris this far out is never coming back and is off every
+// screen, so it is coalesced into remnants of at most
+// TIDAL_DEBRIS_MAX_PARTICLE_MASS each. It is MERGED, not deleted: merging
+// conserves mass, momentum and all eight species exactly, deleting would leak
+// all three. The cost is that the escaped stream stops being a stream, which is
+// why the threshold is hundreds of tidal radii away.
+const TIDAL_DEBRIS_ESCAPE_RADIUS_FACTOR = 400        // x the tidal radius
+const TIDAL_DEBRIS_ESCAPE_MIN_RADIUS = 100           // AU, floor for the above
+const TIDAL_DEBRIS_CLEANUP_INTERVAL = 64             // steps between sweeps
